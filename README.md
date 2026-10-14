@@ -13,6 +13,7 @@ fid.py           CIFAR-10 FID evaluation of generators or saved NumPy samples
 assets/          pretrained FID Inception weights, checksum, and license
 backbone.py      MLP, compact MNIST U-Net, larger CIFAR RGB attention U-Net
 loss.py          ordinary Riesz fields/MMD and softmax Riesz loss
+multiscale.py    coarse-image and aligned-patch training objectives
 data.py         verified dataset downloads and both dataset loaders
 visualization.py shared image grids, trajectories, and MMD plots
 run.sh           shared GPU launcher
@@ -110,6 +111,38 @@ and no weight decay. These are our experiment budgets and training settings,
 rather than a reproduction of the full Score-SDE training recipe.
 
 ## Objectives
+
+### Optional multiscale pixel losses
+
+Enable the full-image, coarse-image, and local-patch combination with:
+
+```bash
+MULTISCALE_LOSS=1 bash run.sh
+```
+
+The generator still takes Gaussian noise and emits one full image in one pass.
+Training applies the selected objective independently to the full image,
+average-pooled views at 8x8 and 16x16, and aligned crops at 7x7 and 14x14.
+For each crop size, one uniformly sampled valid location is shared across the
+generated and real populations; images are not paired. Locations are resampled
+each update using a dedicated RNG with seed `seed + 2`.
+
+The default loss is `(global + mean(coarse views) + mean(patch views)) / 3`.
+CLI options `--coarse-sizes`, `--patch-sizes`, `--crops-per-size`,
+`--global-loss-weight`, `--coarse-loss-weight`, and `--patch-loss-weight` configure
+the views and group weights. A zero weight disables a group. We average within
+groups and normalize the active group weights to sum one. Ordinary Riesz uses
+Euclidean distance divided by the square root of the view dimension; softmax
+Riesz retains its existing batch-distance and per-coordinate normalization.
+
+The configuration records this geometry and RNG convention. Extra CSV columns
+`train_global_surrogate`, `train_coarse_surrogate`, `train_patch_surrogate`, and
+`train_combined_surrogate` average training surrogates over updates in each
+iteration; these values are not MMD energies. Initialization and disabled groups
+have blank entries. FID and the existing full-image MMD diagnostics retain their
+evaluation definitions. Without the flag, training follows the original objective.
+
+### Base objectives
 
 The ordinary Riesz kernel is $k(x,y)=-\|x-y\|_2$. For generated images
 $x_i=G_\theta(z_i)$, the energy is half the biased empirical MMD squared.

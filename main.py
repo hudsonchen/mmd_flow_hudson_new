@@ -17,6 +17,7 @@ from data import (FILES, CIFAR10_ARCHIVES, CIFAR10_CLASSES, download_mnist,
                   download_cifar10, load_dataset, image_shape as dataset_image_shape)
 from loss import backpropagate_objective, mean_distance, mmd_squared, velocity, _riesz_topk_softmax_loss_impl
 from visualization import save_grid, save_trajectory, plot_mmd
+from multiscale import multiscale_loss
 
 
 @torch.no_grad()
@@ -42,7 +43,8 @@ def evaluation_images(model: torch.nn.Module, latent: torch.Tensor) -> torch.Ten
 def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.Tensor,
                    optimizer: torch.optim.Optimizer, chunk_size: int, *,
                    objective: str = "riesz", tau_list: tuple[float, ...] = (0.2, 0.05, 0.02),
-                   normalize_per_temperature: bool = True) -> None:
+                   normalize_per_temperature: bool = True,
+                   multiscale_options: dict | None = None) -> dict:
     """Backpropagate the chosen particle-field rule through the generator.
 
     Ordinary Riesz uses the exact half-MMD image gradient -velocity/N.
@@ -51,9 +53,18 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
     """
     optimizer.zero_grad(set_to_none=True)
     images = model(latent)
-    backpropagate_objective(images, target, chunk_size, objective=objective,
-                            tau_list=tau_list, normalize_per_temperature=normalize_per_temperature)
+    diagnostics = {}
+    if multiscale_options is None:
+        backpropagate_objective(images, target, chunk_size, objective=objective,
+                                tau_list=tau_list, normalize_per_temperature=normalize_per_temperature)
+    else:
+        loss, diagnostics = multiscale_loss(
+            images, target, chunk_size=chunk_size, objective=objective,
+            tau_list=tau_list, normalize_per_temperature=normalize_per_temperature,
+            **multiscale_options)
+        loss.backward()
     optimizer.step()
+    return diagnostics
 
 
 
@@ -104,6 +115,14 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--normalize-per-temperature", action=argparse.BooleanOptionalAction,
                         default=True, help="Normalize each softmax field before summing")
     parser.add_argument("--chunk-size", type=int, default=64)
+    parser.add_argument("--multiscale-loss", action="store_true",
+                        help="Combine full-image, coarse-image and aligned patch objectives")
+    parser.add_argument("--coarse-sizes", type=int, nargs='+', default=[8, 16])
+    parser.add_argument("--patch-sizes", type=int, nargs='+', default=[7, 14])
+    parser.add_argument("--crops-per-size", type=int, default=1)
+    parser.add_argument("--global-loss-weight", type=float, default=1.0)
+    parser.add_argument("--coarse-loss-weight", type=float, default=1.0)
+    parser.add_argument("--patch-loss-weight", type=float, default=1.0)
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--save-snapshots", type=int, default=None,
                         help="Save this many evenly spaced intervals plus initialization; overrides save-every")
@@ -153,6 +172,12 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         parser.error("--hidden-dims must be positive")
     if any(not math.isfinite(tau) or tau <= 0 for tau in args.tau_list):
         parser.error("--tau-list must contain finite positive temperatures")
+    view_weights = [args.global_loss_weight, args.coarse_loss_weight, args.patch_loss_weight]
+    if any(not math.isfinite(w) or w < 0 for w in view_weights) or sum(view_weights) <= 0:
+        parser.error("loss weights must be finite, nonnegative, and have positive sum")
+    side = 28 if args.dataset == 'mnist' else 32
+    if args.crops_per_size < 1 or any(s < 1 or s > side for s in args.coarse_sizes + args.patch_sizes):
+        parser.error("view sizes must fit the image and crops-per-size must be positive")
     return args
 
 
@@ -188,6 +213,13 @@ def main(default_dataset: str = "cifar10") -> None:
     # Evaluation identities stay fixed; training uses independent fresh latents.
     eval_latent = torch.randn((args.particles, args.latent_dim), generator=rng).to(device)
     train_latent_rng = torch.Generator().manual_seed(args.seed + 1)
+    multiscale_options = None
+    if args.multiscale_loss:
+        multiscale_options = dict(
+            image_shape=image_shape, coarse_sizes=args.coarse_sizes, patch_sizes=args.patch_sizes,
+            crops_per_size=args.crops_per_size, patch_rng=torch.Generator().manual_seed(args.seed + 2),
+            global_weight=args.global_loss_weight, coarse_weight=args.coarse_loss_weight,
+            patch_weight=args.patch_loss_weight)
     model = build_backbone(args.dataset, args.architecture, args.latent_dim, args.base_channels,
                            args.hidden_dims, args.num_res_blocks).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -233,6 +265,14 @@ def main(default_dataset: str = "cifar10") -> None:
                   if args.save_snapshots else sorted(set(range(0, total_iterations + 1, args.save_every)) | {total_iterations}))
     if args.dataset == "cifar10":
         config["class_names"] = CIFAR10_CLASSES
+    if args.multiscale_loss:
+        config.update(training_view_geometry="full_image_and_average_pooled_images_and_aligned_crops",
+                      patch_sampling_seed=args.seed + 2,
+                      patch_alignment="shared_coordinates_across_generated_and_real_populations",
+                      view_weighting="mean_within_group_then_normalized_group_weights",
+                      view_distance_scaling="upstream_batch_distance_scale" if args.objective == 'softmax-riesz'
+                      else "euclidean_distance_divided_by_sqrt_view_dimension",
+                      training_loss_diagnostic="mean_over_updates_in_iteration_gradient_surrogates_not_mmd_energy")
     if args.objective == "softmax-riesz":
         source_path = Path(__file__).with_name("loss.py")
         config.update(softmax_source_repository="https://github.com/hudsonchen/riesz_flow_hudson",
@@ -269,13 +309,16 @@ def main(default_dataset: str = "cifar10") -> None:
     trajectory_states, trajectory_iterations, history = [], [], []
     update_count = 0
     fid_history = []
+    training_stats, training_updates = {}, 0
+    loss_names = ('global', 'coarse', 'patch', 'combined') if args.multiscale_loss else ()
     print(f"Neural {args.objective}: {config['architecture']}, {config['parameter_count']} parameters, "
           f"{len(x)} generated particles, {len(target)} targets, {device}", flush=True)
     with (args.output / "metrics.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
                          "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
-                        + (["fid"] if fid_evaluator is not None else []))
+                        + (["fid"] if fid_evaluator is not None else [])
+                        + [f'train_{name}_surrogate' for name in loss_names])
         for iteration in range(total_iterations + 1):
             if iteration > 0:
                 x = evaluation_images(evaluation_model, eval_latent)
@@ -305,7 +348,9 @@ def main(default_dataset: str = "cifar10") -> None:
                 writer.writerow([iteration, iteration if unit == "epoch" else "", update_count,
                                  train_mmd, test_mmd, speed,
                                  x.min().item(), x.max().item(), time.monotonic() - started]
-                                + ([fid_value] if fid_evaluator is not None else []))
+                                + ([fid_value] if fid_evaluator is not None else [])
+                                + [float(training_stats[name]) / training_updates
+                                   if name in training_stats else '' for name in loss_names])
                 stream.flush()
                 history.append((iteration, train_mmd, test_mmd))
                 print(f"{unit}={iteration:6d} updates={update_count} train MMD²={train_mmd:.6f} heldout MMD²={test_mmd:.6f} "
@@ -323,13 +368,18 @@ def main(default_dataset: str = "cifar10") -> None:
                 batches = epoch_batches(len(target), batch_size, rng)
             else:
                 batches = [torch.randperm(len(target), generator=rng)[:batch_size]]
+            training_stats, training_updates = {}, 0
             for ids in batches:
                 batch = target[ids.to(device)]
                 train_latent = torch.randn((args.particles, args.latent_dim),
                                            generator=train_latent_rng).to(device)
-                generator_step(model, train_latent, batch, optimizer, args.chunk_size,
+                step_diagnostics = generator_step(model, train_latent, batch, optimizer, args.chunk_size,
                                objective=args.objective, tau_list=tuple(args.tau_list),
-                               normalize_per_temperature=args.normalize_per_temperature)
+                               normalize_per_temperature=args.normalize_per_temperature,
+                               multiscale_options=multiscale_options)
+                for name, value in step_diagnostics.items():
+                    training_stats[name] = training_stats.get(name, 0) + value
+                training_updates += 1
                 if ema_model is not None:
                     update_ema(model, ema_model, args.ema_decay)
                 update_count += 1

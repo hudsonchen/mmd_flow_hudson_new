@@ -32,6 +32,15 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 NUM_RES_BLOCKS="${NUM_RES_BLOCKS:-4}"
 SEED="${SEED:-0}"
 DATA_ROOT="${DATA_ROOT:-/home/zongchen/data}"
+MULTISCALE_LOSS="${MULTISCALE_LOSS:-0}"
+LOSS_ARGS=()
+LOSS_NAME=""
+if [[ "$MULTISCALE_LOSS" == 1 ]]; then
+    LOSS_ARGS+=(--multiscale-loss)
+    LOSS_NAME="_multiscale"
+elif [[ "$MULTISCALE_LOSS" != 0 ]]; then
+    printf 'MULTISCALE_LOSS must be 0 or 1\n' >&2; exit 1
+fi
 if [[ "$ARCHITECTURE" == "unet" ]]; then
     LATENT_DIM="${LATENT_DIM:-$IMAGE_DIM}"
     ARCH_NAME="unet${BASE_CHANNELS}_noise${LATENT_DIM}"
@@ -44,7 +53,7 @@ elif [[ "$ARCHITECTURE" == "mlp" ]]; then
 else
     printf 'Unknown ARCHITECTURE: %s\n' "$ARCHITECTURE" >&2; exit 1
 fi
-RUN_NAME="${DATASET}_${OBJECTIVE}_${ARCH_NAME}_resampled_fulltrain_particles${PARTICLES}_batch${BATCH_SIZE}_epochs${EPOCHS}_lr${LEARNING_RATE}_ema${EMA_DECAY}_seed${SEED}_gpu"
+RUN_NAME="${DATASET}_${OBJECTIVE}${LOSS_NAME}_${ARCH_NAME}_resampled_fulltrain_particles${PARTICLES}_batch${BATCH_SIZE}_epochs${EPOCHS}_lr${LEARNING_RATE}_ema${EMA_DECAY}_seed${SEED}_gpu"
 OUTPUT="${OUTPUT:-${SCRIPT_DIR}/results/${RESULT_GROUP}/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)_$$}"
 if [[ ! -x "$PYTHON" ]]; then
     printf 'Python environment not found: %s\n' "$PYTHON" >&2; exit 1
@@ -62,4 +71,5 @@ mkdir -p -- "$OUTPUT"
     --architecture "$ARCHITECTURE" --base-channels "$BASE_CHANNELS" \
     --num-res-blocks "$NUM_RES_BLOCKS" --latent-dim "$LATENT_DIM" \
     --seed "$SEED" --device cuda --save-every "$SAVE_EVERY" --trajectory-particles 8 \
+    "${LOSS_ARGS[@]}" \
     --output "$OUTPUT" 2>&1 | tee "$OUTPUT/run.log"

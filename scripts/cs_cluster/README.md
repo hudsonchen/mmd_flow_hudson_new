@@ -11,8 +11,20 @@ FID weights in `assets/`, and the verified CIFAR-10 archive in `data/`:
 qsub -P aihub_ucl scripts/cs_cluster/run_cifar_h100.sh
 ```
 
+The dedicated multiscale launcher enables the full-image, 8x8/16x16 coarse-image,
+and aligned 7x7/14x14 patch losses with the same DDPM++/EMA recipe:
+
+```bash
+qsub -P aihub_ucl scripts/cs_cluster/run_cifar_multiscale_h100.sh
+```
+
+Its result directory includes `_multiscale` before the job ID. The source copy
+on SAN must include `multiscale.py` and `tests/test_multiscale.py`.
+
 The merged scheduler log is written to the home directory as
-`/home/zongchen/cifar_ddpmpp_ema.o<JOB_ID>`, using the number returned by `qsub`.
+`/home/zongchen/cifar_ddpmpp_ema.o<JOB_ID>` for the base launcher, or
+`/home/zongchen/cifar_multiscale.o<JOB_ID>` for the multiscale launcher,
+using the number returned by `qsub`.
 
 This default applies to new submissions. An explicit `qsub -o` overrides it.
 
@@ -33,7 +45,7 @@ python scripts/cs_cluster/sync_cifar_h100.py path/to/deployment.json
 
 The deployment JSON contains `job_id`, `remote_source`, `remote_output`, and
 `local_output`. For new submissions, also set `remote_log` to
-`/home/zongchen/cifar_ddpmpp_ema.o<JOB_ID>`. Older deployment records without this
+the appropriate home-directory scheduler log above. Older deployment records without this
 field retain their original `remote_source/scheduler.log` location.
 The watcher uses the `cs-cluster` SSH alias, copies available
 outputs every 300 seconds, and verifies final artifact hashes after completion.

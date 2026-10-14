@@ -12,7 +12,11 @@ set -euo pipefail
 [[ "$PWD" == /SAN/* ]] || { echo 'Submit from the SAN source snapshot.' >&2; exit 1; }
 export PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
 export DATA_ROOT="$PWD/data"
-export OUTPUT="$PWD/results/cifar/h100_ddpmpp_ema0999_${JOB_ID}"
+MULTISCALE_LOSS="${MULTISCALE_LOSS:-0}"
+export MULTISCALE_LOSS
+LOSS_NAME=""
+if [[ "$MULTISCALE_LOSS" == 1 ]]; then LOSS_NAME="_multiscale"; fi
+export OUTPUT="$PWD/results/cifar/h100_ddpmpp_ema0999${LOSS_NAME}_${JOB_ID}"
 export EMA_DECAY=0.999 EPOCHS=2000 SAVE_EVERY=20 PARTICLES=64 BATCH_SIZE=256
 export DATASET=cifar10 ARCHITECTURE=unet OBJECTIVE=softmax-riesz
 export BASE_CHANNELS=128 NUM_RES_BLOCKS=4 LATENT_DIM=3072 LEARNING_RATE=0.0002 SEED=0
@@ -56,5 +60,5 @@ assert torch.cuda.is_available()
 name=torch.cuda.get_device_name(0);print('Allocated GPU:',name,flush=True)
 assert 'H100' in name, name
 PY
-"$PYTHON" -m unittest tests.test_cifar tests.test_mnist tests.test_softmax tests.test_fid
+"$PYTHON" -m unittest -v tests.test_cifar tests.test_mnist tests.test_multiscale tests.test_fid
 bash run.sh
