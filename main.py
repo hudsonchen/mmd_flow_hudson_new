@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Train one-pass image generators with Riesz objectives on MNIST or CIFAR-10."""
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import json
+import math
+from pathlib import Path
+import time
+import torch
+
+from backbone import build_backbone, backbone_metadata
+from data import (FILES, CIFAR10_ARCHIVES, CIFAR10_CLASSES, download_mnist,
+                  download_cifar10, load_dataset, image_shape as dataset_image_shape)
+from loss import backpropagate_objective, mean_distance, mmd_squared, velocity, _riesz_topk_softmax_loss_impl
+from visualization import save_grid, save_trajectory, plot_mmd
+
+
+@torch.no_grad()
+def update_ema(model: torch.nn.Module, ema_model: torch.nn.Module, decay: float) -> None:
+    """Average post-update parameters; copy non-parameter state from the live model."""
+    for averaged, current in zip(ema_model.parameters(), model.parameters()):
+        averaged.lerp_(current.detach(), 1 - decay)
+    for averaged, current in zip(ema_model.buffers(), model.buffers()):
+        averaged.copy_(current)
+
+
+@torch.no_grad()
+def evaluation_images(model: torch.nn.Module, latent: torch.Tensor) -> torch.Tensor:
+    """Disable dropout for diagnostics without changing training mode or its RNG."""
+    training = model.training
+    model.eval()
+    try:
+        return model(latent)
+    finally:
+        model.train(training)
+
+
+def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.Tensor,
+                   optimizer: torch.optim.Optimizer, chunk_size: int, *,
+                   objective: str = "riesz", tau_list: tuple[float, ...] = (0.2, 0.05, 0.02),
+                   normalize_per_temperature: bool = True) -> None:
+    """Backpropagate the chosen particle-field rule through the generator.
+
+    Ordinary Riesz uses the exact half-MMD image gradient -velocity/N.
+    Softmax Riesz uses upstream's scaled, detached-goal regression loss.
+    Only model parameters are optimized, never latents or output particles.
+    """
+    optimizer.zero_grad(set_to_none=True)
+    images = model(latent)
+    backpropagate_objective(images, target, chunk_size, objective=objective,
+                            tau_list=tau_list, normalize_per_temperature=normalize_per_temperature)
+    optimizer.step()
+
+
+
+def snapshot_steps(steps: int, intervals: int) -> set[int]:
+    return {0, *(math.ceil(steps * index / intervals) for index in range(1, intervals + 1))}
+
+
+
+def epoch_batches(size: int, batch_size: int, rng: torch.Generator):
+    """Visit every target exactly once in a freshly shuffled epoch, without dropping the tail."""
+    order = torch.randperm(size, generator=rng)
+    for start in range(0, size, batch_size):
+        yield order[start:start + batch_size]
+
+
+
+def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path, default=Path("/home/zongchen/data"))
+    parser.add_argument("--dataset", choices=("mnist", "cifar10"), default=default_dataset)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--download-only", action="store_true")
+    parser.add_argument("--particles", type=int, default=256)
+    parser.add_argument("--target-size", type=int, default=2048,
+                        help="Fixed training subset; 0 uses all eligible training images")
+    parser.add_argument("--target-batch-size", type=int, default=0,
+                        help="0: full-target field; positive: minibatch size (exhaustive shuffled batches in epoch mode)")
+    parser.add_argument("--eval-size", type=int, default=512)
+    parser.add_argument("--fid-samples", type=int, default=10000,
+                        help="CIFAR-10 generated images for FID at saved snapshots")
+    parser.add_argument("--fid-batch-size", type=int, default=64)
+    parser.add_argument("--digit", type=int, choices=range(10), default=None)
+    parser.add_argument("--class-id", type=int, choices=range(10), default=None)
+    duration = parser.add_mutually_exclusive_group()
+    duration.add_argument("--steps", type=int, default=None, help="Number of individual updates")
+    duration.add_argument("--epochs", type=int, default=None, help="Number of full passes over the target dataset")
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--ema-decay", type=float, default=None,
+                        help="EMA decay per optimizer update; default 0.999 for CIFAR, 0 for MNIST; 0 disables")
+    parser.add_argument("--architecture", choices=("unet", "mlp"), default="unet")
+    parser.add_argument("--base-channels", type=int, default=None)
+    parser.add_argument("--num-res-blocks", type=int, default=4, help="Residual blocks per CIFAR U-Net stage")
+    parser.add_argument("--latent-dim", type=int, default=None,
+                        help="Spatial U-Net noise: 784 for MNIST, 3072 for CIFAR-10; MLP: 32")
+    parser.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 256])
+    parser.add_argument("--objective", choices=("softmax-riesz", "riesz"), default="softmax-riesz")
+    parser.add_argument("--tau-list", type=float, nargs="+", default=[0.2, 0.05, 0.02])
+    parser.add_argument("--normalize-per-temperature", action=argparse.BooleanOptionalAction,
+                        default=True, help="Normalize each softmax field before summing")
+    parser.add_argument("--chunk-size", type=int, default=64)
+    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--save-snapshots", type=int, default=None,
+                        help="Save this many evenly spaced intervals plus initialization; overrides save-every")
+    parser.add_argument("--trajectory-particles", type=int, default=8,
+                        help="Number of fixed particle identities shown in trajectory.png")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    args = parser.parse_args()
+    if args.fid_samples < 2 or args.fid_batch_size < 1:
+        parser.error("FID needs at least two samples and a positive batch size")
+    if args.learning_rate is None:
+        args.learning_rate = 1e-3 if args.dataset == "mnist" else 2e-4
+    if args.ema_decay is None:
+        args.ema_decay = 0.999 if args.dataset == "cifar10" else 0.0
+    if not math.isfinite(args.ema_decay) or not 0 <= args.ema_decay < 1:
+        parser.error("--ema-decay must be finite and in [0, 1)")
+    image_dim = 784 if args.dataset == "mnist" else 3072
+    if args.output is None:
+        args.output = Path("results") / ("mnist" if args.dataset == "mnist" else "cifar") / f"{args.dataset}_riesz_p1"
+    if args.base_channels is None:
+        args.base_channels = 32 if args.dataset == "mnist" else 128
+    if args.digit is not None:
+        if args.dataset != "mnist":
+            parser.error("--digit is MNIST-only; use --class-id for CIFAR-10")
+        if args.class_id is not None:
+            parser.error("use only one of --digit and --class-id")
+        args.class_id = args.digit
+    if args.latent_dim is None:
+        args.latent_dim = image_dim if args.architecture == "unet" else 32
+    if args.architecture == "unet" and args.latent_dim != image_dim:
+        parser.error(f"the {args.dataset} U-Net requires --latent-dim {image_dim}")
+    if args.steps is None and args.epochs is None:
+        args.steps = 2000
+    for key in ("particles", "eval_size", "chunk_size", "save_every", "threads", "trajectory_particles", "latent_dim", "base_channels", "num_res_blocks"):
+        if getattr(args, key) <= 0:
+            parser.error(f"--{key.replace('_', '-')} must be positive")
+    if ((args.steps is not None and args.steps < 0) or
+            (args.epochs is not None and args.epochs < 0) or
+            args.target_size < 0 or args.target_batch_size < 0):
+        parser.error("steps and target sizes must be nonnegative")
+    if args.save_snapshots is not None and args.save_snapshots <= 0:
+        parser.error("--save-snapshots must be positive")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        parser.error("--learning-rate must be finite and positive")
+    if any(width <= 0 for width in args.hidden_dims):
+        parser.error("--hidden-dims must be positive")
+    if any(not math.isfinite(tau) or tau <= 0 for tau in args.tau_list):
+        parser.error("--tau-list must contain finite positive temperatures")
+    return args
+
+
+
+def main(default_dataset: str = "cifar10") -> None:
+    args = parse_args(default_dataset)
+    if args.download_only:
+        raw = download_mnist(args.data_root) if args.dataset == "mnist" else download_cifar10(args.data_root)
+        print(f"{args.dataset} downloaded and checksums verified: {raw}")
+        return
+    torch.set_num_threads(args.threads)
+    torch.manual_seed(args.seed)
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    if device == "auto":
+        device = "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable in this Python environment")
+    rng = torch.Generator().manual_seed(args.seed)
+    raw, (train, train_labels), (test, test_labels) = load_dataset(args.dataset, args.data_root)
+    image_shape = dataset_image_shape(args.dataset)
+    image_dim = math.prod(image_shape)
+    train_ids = torch.arange(len(train))
+    test_ids = torch.arange(len(test))
+    if args.class_id is not None:
+        train_ids = train_ids[train_labels == args.class_id]
+        test_ids = test_ids[test_labels == args.class_id]
+    train_ids = train_ids[torch.randperm(len(train_ids), generator=rng)]
+    if args.target_size:
+        train_ids = train_ids[:args.target_size]
+    test_ids = test_ids[torch.randperm(len(test_ids), generator=rng)[:args.eval_size]]
+    target = train[train_ids].to(device=device, dtype=torch.float32) / 255
+    heldout = test[test_ids].to(device=device, dtype=torch.float32) / 255
+    # Evaluation identities stay fixed; training uses independent fresh latents.
+    eval_latent = torch.randn((args.particles, args.latent_dim), generator=rng).to(device)
+    train_latent_rng = torch.Generator().manual_seed(args.seed + 1)
+    model = build_backbone(args.dataset, args.architecture, args.latent_dim, args.base_channels,
+                           args.hidden_dims, args.num_res_blocks).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    ema_model = copy.deepcopy(model).requires_grad_(False).eval() if args.ema_decay else None
+    evaluation_model = ema_model if ema_model is not None else model
+    x = evaluation_images(evaluation_model, eval_latent)
+    args.output.mkdir(parents=True, exist_ok=True)
+    if (args.output / "config.json").exists():
+        raise FileExistsError(f"Existing run in {args.output}; choose a fresh --output")
+    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    unit = "epoch" if args.epochs is not None else "step"
+    total_iterations = args.epochs if unit == "epoch" else args.steps
+    batch_size = args.target_batch_size or len(target)
+    updates_per_iteration = math.ceil(len(target) / batch_size) if unit == "epoch" else 1
+    config.update(kernel="-euclidean_distance", power=1, device=device,
+                  actual_target_size=len(target), actual_eval_size=len(heldout),
+                  torch_version=str(torch.__version__),
+                  initialization="ddpm_fan_average_uniform_near_zero_output_branches"
+                  if args.dataset == "cifar10" and args.architecture == "unet" else "pytorch_default",
+                  parameterization="neural_generator", latent_distribution="standard_normal",
+                  training_latent_sampling="resample_every_update",
+                  training_latent_seed=args.seed + 1,
+                  evaluation_latent_sampling="fixed_independent_standard_normal",
+                  architecture=backbone_metadata(args.dataset, args.architecture, args.latent_dim,
+                                                 args.base_channels, args.hidden_dims, args.num_res_blocks),
+                  hidden_activation="SiLU", output_activation="Sigmoid",
+                  parameter_count=sum(p.numel() for p in model.parameters()),
+                  training_rule="detached_scaled_velocity_regression" if args.objective == "softmax-riesz"
+                  else "exact_half_mmd_gradient",
+                  evaluation_metric="fid" if args.dataset == "cifar10" else "biased_empirical_riesz_mmd_squared",
+                  energy="softmax_field_surrogate" if args.objective == "softmax-riesz"
+                  else "0.5 * biased_empirical_mmd_squared", optimizer="Adam",
+                  adam_betas=[0.9, 0.999], adam_eps=1e-8, weight_decay=0,
+                  dataset_md5=FILES if args.dataset == "mnist" else {raw.name: CIFAR10_ARCHIVES[raw.name]},
+                  data_source=str(raw.resolve()),
+                  image_shape=image_shape, pixel_scaling="uint8_div_255", iteration_unit=unit,
+                  updates_per_iteration=updates_per_iteration,
+                  total_updates=total_iterations * updates_per_iteration,
+                  evaluation_weights="ema" if ema_model is not None else "raw",
+                  ema_update_unit="optimizer_step" if ema_model is not None else None,
+                  ema_initialization="copy_initial_model" if ema_model is not None else None,
+                  snapshot_iterations=sorted(snapshot_steps(total_iterations, args.save_snapshots))
+                  if args.save_snapshots else sorted(set(range(0, total_iterations + 1, args.save_every)) | {total_iterations}))
+    if args.dataset == "cifar10":
+        config["class_names"] = CIFAR10_CLASSES
+    if args.objective == "softmax-riesz":
+        source_path = Path(__file__).with_name("loss.py")
+        config.update(softmax_source_repository="https://github.com/hudsonchen/riesz_flow_hudson",
+                      softmax_source_revision="777d696f31340a1370f5b39a2e7d000464b10526",
+                      softmax_module_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                      softmax_epsilon=1e-6, softmax_direction_epsilon=1e-8,
+                      softmax_rms_epsilon=1e-8, softmax_feature_space="raw_pixels",
+                      softmax_fixed_negatives=False,
+                      velocity_diagnostic="normalized_field_in_scaled_pixel_space")
+    else:
+        config["velocity_diagnostic"] = "ordinary_riesz_field_in_pixel_space"
+    fid_evaluator = None
+    if args.dataset == "cifar10":
+        from fid import CIFAR10FID, WEIGHTS
+        real = train if args.class_id is None else train[train_labels == args.class_id]
+        fid_evaluator = CIFAR10FID(real, device=device, batch_size=args.fid_batch_size)
+        config.update(fid_reference_split="train", fid_reference_count=len(real),
+                      fid_feature_dim=2048, fid_latent_seed=args.seed + 12345,
+                      fid_evaluation_iterations=config["snapshot_iterations"],
+                      fid_inception="pytorch-fid-v0.3.0",
+                      fid_weights_sha256=hashlib.sha256(WEIGHTS.read_bytes()).hexdigest(),
+                      fid_preprocessing="float [0,1]; bilinear 299x299 align_corners=False; scale to [-1,1]",
+                      diagnostic_metric="biased_empirical_riesz_mmd_squared")
+    (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    (args.output / "data_indices.json").write_text(json.dumps(
+        {"train_indices": train_ids.tolist(), "test_indices": test_ids.tolist()}) + "\n")
+    save_grid(target, args.output / "target.png", image_shape=image_shape)
+    save_grid(heldout, args.output / "heldout.png", image_shape=image_shape)
+    eval_train = target[:args.eval_size]
+    train_yy = mean_distance(eval_train, eval_train, args.chunk_size)
+    test_yy = mean_distance(heldout, heldout, args.chunk_size)
+    started = time.monotonic()
+    save_iterations = set(config["snapshot_iterations"])
+    trajectory_states, trajectory_iterations, history = [], [], []
+    update_count = 0
+    fid_history = []
+    print(f"Neural {args.objective}: {config['architecture']}, {config['parameter_count']} parameters, "
+          f"{len(x)} generated particles, {len(target)} targets, {device}", flush=True)
+    with (args.output / "metrics.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
+                         "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
+                        + (["fid"] if fid_evaluator is not None else []))
+        for iteration in range(total_iterations + 1):
+            if iteration > 0:
+                x = evaluation_images(evaluation_model, eval_latent)
+                if not torch.isfinite(x).all():
+                    raise RuntimeError(f"Nonfinite generated images after update {update_count}")
+            # Evaluate every full epoch, even when particle grids are saved less often.
+            if unit == "epoch" or iteration in save_iterations:
+                fid_value = ""
+                if fid_evaluator is not None and iteration in save_iterations:
+                    fid_value = fid_evaluator.evaluate_generator(
+                        evaluation_model, args.latent_dim, count=args.fid_samples, seed=args.seed + 12345)
+                    fid_history.append((iteration, fid_value))
+                    (args.output / "fid_metrics.json").write_text(json.dumps(
+                        [{"iteration": i, "fid": f} for i, f in fid_history], indent=2) + "\n")
+                    print(f"{unit}={iteration} FID={fid_value:.6f} ({args.fid_samples} generated images)", flush=True)
+                train_mmd = mmd_squared(x, eval_train, train_yy, args.chunk_size)
+                test_mmd = mmd_squared(x, heldout, test_yy, args.chunk_size)
+                # Report the velocity on the fixed evaluation target, separately from MMD.
+                if args.objective == "softmax-riesz":
+                    with torch.no_grad():
+                        _, info = _riesz_topk_softmax_loss_impl(
+                            x.unsqueeze(0), eval_train.unsqueeze(0), tau_list=args.tau_list,
+                            normalize_per_temperature=args.normalize_per_temperature, epsilon=1e-6)
+                    speed = info["riesz_topk_softmax_velocity_rms"].item()
+                else:
+                    speed = velocity(x, eval_train, args.chunk_size).square().mean().sqrt().item()
+                writer.writerow([iteration, iteration if unit == "epoch" else "", update_count,
+                                 train_mmd, test_mmd, speed,
+                                 x.min().item(), x.max().item(), time.monotonic() - started]
+                                + ([fid_value] if fid_evaluator is not None else []))
+                stream.flush()
+                history.append((iteration, train_mmd, test_mmd))
+                print(f"{unit}={iteration:6d} updates={update_count} train MMD²={train_mmd:.6f} heldout MMD²={test_mmd:.6f} "
+                      f"elapsed={time.monotonic() - started:.1f}s", flush=True)
+            if iteration in save_iterations:
+                save_grid(x, args.output / f"particles_{unit}_{iteration:06d}.png", image_shape=image_shape)
+                trajectory_states.append(x.detach().cpu().reshape(-1, *image_shape).clone())
+                trajectory_iterations.append(iteration)
+                save_trajectory(trajectory_states, trajectory_iterations, args.output,
+                                args.trajectory_particles, unit)
+                plot_mmd(history, args.output, unit, fid_history=fid_history)
+            if iteration == total_iterations:
+                break
+            if unit == "epoch":
+                batches = epoch_batches(len(target), batch_size, rng)
+            else:
+                batches = [torch.randperm(len(target), generator=rng)[:batch_size]]
+            for ids in batches:
+                batch = target[ids.to(device)]
+                train_latent = torch.randn((args.particles, args.latent_dim),
+                                           generator=train_latent_rng).to(device)
+                generator_step(model, train_latent, batch, optimizer, args.chunk_size,
+                               objective=args.objective, tau_list=tuple(args.tau_list),
+                               normalize_per_temperature=args.normalize_per_temperature)
+                if ema_model is not None:
+                    update_ema(model, ema_model, args.ema_decay)
+                update_count += 1
+    print(f"Finished. Results: {args.output.resolve()}")
+
+
+
+if __name__ == "__main__":
+    main()

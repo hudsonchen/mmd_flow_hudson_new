@@ -1,0 +1,58 @@
+{
+  "comparison": "single_seed_complete_training_recipes",
+  "seed": 0,
+  "epochs": 100,
+  "updates": 23500,
+  "matched_keys": [
+    "architecture",
+    "parameter_count",
+    "seed",
+    "particles",
+    "latent_dim",
+    "training_latent_sampling",
+    "training_latent_seed",
+    "evaluation_latent_sampling",
+    "actual_target_size",
+    "actual_eval_size",
+    "target_batch_size",
+    "eval_size",
+    "epochs",
+    "learning_rate",
+    "optimizer",
+    "adam_betas",
+    "adam_eps",
+    "weight_decay",
+    "iteration_unit",
+    "snapshot_iterations",
+    "updates_per_iteration",
+    "total_updates"
+  ],
+  "identical_initial_image_grid": true,
+  "identical_data_indices": true,
+  "late_epoch_window": [
+    91,
+    100
+  ],
+  "runs": {
+    "Standard Riesz": {
+      "path": "results/mnist/mnist_riesz_unet32_noise784_resampled_fulltrain_particles64_batch256_epochs100_lr0.001_seed0_gpu_20261014_170255_2687530",
+      "config_sha256": "15a70ebb36bb48ff286ce8a05894d0ac0e1db564907ad54d04a4b83a923687fe",
+      "metrics_sha256": "b9e7ae65bafffaedfa16f8bbcceb8c1b85b8b543c95cbf89971f7081b1d3cc95",
+      "final_train_mmd_squared": 0.17843570789591467,
+      "final_heldout_mmd_squared": 0.1735027083705063,
+      "mean_heldout_mmd_squared_epochs_91_100": 0.19524865116982254,
+      "elapsed_seconds": 211.311895057559
+    },
+    "Softmax Riesz": {
+      "path": "results/mnist/mnist_softmax-riesz_unet32_noise784_resampled_fulltrain_particles64_batch256_epochs100_lr0.001_seed0_gpu_20261014_165242_2685776",
+      "config_sha256": "a9a7cb982fff9fd8127e2981e716e1764388cdeaa932dba904e9bca6560076ba",
+      "metrics_sha256": "1b43f3c0fb83c2d51569857e4ad43b3d3af17b7372bcd91a4db66069beaa5236",
+      "final_train_mmd_squared": 0.20210466013850237,
+      "final_heldout_mmd_squared": 0.21450205863220617,
+      "mean_heldout_mmd_squared_epochs_91_100": 0.1854418447946955,
+      "elapsed_seconds": 272.7682238621637
+    }
+  },
+  "softmax_relative_reduction_final_heldout_mmd_squared": -0.23630380555298203,
+  "softmax_relative_reduction_mean_heldout_mmd_squared_epochs_91_100": 0.050227268236528455
+}
