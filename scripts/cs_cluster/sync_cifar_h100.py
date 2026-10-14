@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Copy H100 previews while running; verify every final artifact after completion."""
+"""Copy H100 previews while running; verify every final artifact after completion.
+
+Usage: python scripts/cs_cluster/sync_cifar_h100.py path/to/deployment.json
+"""
 import argparse
 import datetime
 import hashlib

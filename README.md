@@ -16,6 +16,7 @@ loss.py          ordinary Riesz fields/MMD and softmax Riesz loss
 data.py         verified dataset downloads and both dataset loaders
 visualization.py shared image grids, trajectories, and MMD plots
 run.sh           shared GPU launcher
+scripts/cs_cluster/ CIFAR-10 H100 launcher and result transfer watcher
 tests/          mathematical, gradient, backbone, and data/rendering checks
 notebooks/       reproducible saved-result comparisons
 results/mnist/   MNIST experiments
@@ -71,6 +72,9 @@ uses all eligible training images; positive sizes select a fixed subset.
 Without either duration option, the CLI defaults to 2,000 updates.
 
 ## Backbones
+
+For CIFAR-10 H100 submission with `-P aihub_ucl` and result copying back from
+the cluster, see [scripts/cs_cluster/README.md](scripts/cs_cluster/README.md).
 
 All architectures are built through `backbone.build_backbone` and described by
 `backbone.backbone_metadata`:

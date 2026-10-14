@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Submit from the project root on SAN: qsub -P aihub_ucl scripts/cs_cluster/run_cifar_h100.sh
 #$ -S /bin/bash
 #$ -N cifar_ddpmpp_ema
 #$ -P aihub_ucl
