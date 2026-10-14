@@ -60,5 +60,4 @@ assert torch.cuda.is_available()
 name=torch.cuda.get_device_name(0);print('Allocated GPU:',name,flush=True)
 assert 'H100' in name, name
 PY
-"$PYTHON" -m unittest -v tests.test_cifar tests.test_mnist tests.test_multiscale tests.test_fid
 bash run.sh

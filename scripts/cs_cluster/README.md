@@ -33,7 +33,7 @@ The default Python environment is
 `/home/zongchen/miniconda3/envs/mmd_flow/bin/python`. To select another existing
 environment, pass `-v PYTHON=/absolute/path/to/python` to `qsub`.
 
-The launcher checks the allocated GPU and runs the unit tests before training.
+The launcher checks the allocated GPU, then starts training directly.
 It saves outputs under `results/cifar/h100_ddpmpp_ema0999_<JOB_ID>/`, including
 `job_status.json`, `run.log`, metrics, and images. Successful completion produces
 `artifact_manifest.json` for SHA-256 verification.
