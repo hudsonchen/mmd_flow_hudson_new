@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Submit from the project root on SAN: qsub -P aihub_ucl scripts/cs_cluster/run_cifar_h100.sh
+# Submit from the project root: qsub -P aihub_ucl scripts/cs_cluster/run_cifar_h100.sh
 #$ -S /bin/bash
 #$ -N cifar_ddpmpp_ema
 #$ -P aihub_ucl
@@ -9,7 +9,7 @@
 #$ -j y
 #$ -o /home/zongchen/
 set -euo pipefail
-[[ "$PWD" == /SAN/* ]] || { echo 'Submit from the SAN source snapshot.' >&2; exit 1; }
+[[ -f "$PWD/main.py" && -f "$PWD/run.sh" ]] || { echo 'Submit from the project root containing main.py and run.sh.' >&2; exit 1; }
 export PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
 export DATA_ROOT="$PWD/data"
 MULTISCALE_LOSS="${MULTISCALE_LOSS:-0}"

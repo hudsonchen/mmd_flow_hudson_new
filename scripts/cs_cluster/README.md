@@ -4,10 +4,11 @@
 softmax Riesz, EMA 0.999, and a 2,000-epoch budget. It requests one H100,
 32 GB host memory, 48 hours, and the `aihub_ucl` project.
 
-On `cs-cluster`, change to the project root under `/SAN/`, with the source,
+On `cs-cluster`, change to `/home/zongchen/mmd_flow_hudson_new`, with the source,
 FID weights in `assets/`, and the verified CIFAR-10 archive in `data/`:
 
 ```bash
+cd /home/zongchen/mmd_flow_hudson_new
 qsub -P aihub_ucl scripts/cs_cluster/run_cifar_h100.sh
 ```
 
@@ -19,7 +20,7 @@ qsub -P aihub_ucl scripts/cs_cluster/run_cifar_multiscale_h100.sh
 ```
 
 Its result directory includes `_multiscale` before the job ID. The source copy
-on SAN must include `multiscale.py` and `tests/test_multiscale.py`.
+must include `multiscale.py` and `tests/test_multiscale.py`.
 
 The merged scheduler log is written to the home directory as
 `/home/zongchen/cifar_ddpmpp_ema.o<JOB_ID>` for the base launcher, or

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Submit from the project root on SAN:
+# Submit from the project root:
 # qsub -P aihub_ucl scripts/cs_cluster/run_cifar_multiscale_h100.sh
 #$ -S /bin/bash
 #$ -N cifar_multiscale
