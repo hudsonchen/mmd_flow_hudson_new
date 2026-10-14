@@ -16,6 +16,7 @@ parser.add_argument('deployment', type=Path)
 parser.add_argument('--interval', type=int, default=300)
 args = parser.parse_args()
 deployment = json.loads(args.deployment.read_text())
+remote_log = deployment.get('remote_log', deployment['remote_source'] + '/scheduler.log')
 destination = Path(deployment['local_output'])
 destination.mkdir(parents=True, exist_ok=True)
 status_path = destination / 'transfer_status.json'
@@ -48,7 +49,7 @@ while True:
                                check=True, timeout=1800)
                 subprocess.run(['rsync', '-a', '--delay-updates', '-e',
                                 'ssh -o BatchMode=yes -o ConnectTimeout=15',
-                                'cs-cluster:' + deployment['remote_source'] + '/scheduler.log',
+                                'cs-cluster:' + remote_log,
                                 str(destination / 'scheduler.log')], check=True, timeout=120)
                 record('partial_synced', remote_status=state,
                        note='Run is incomplete; final artifact hashes are not yet available.')
@@ -59,7 +60,7 @@ while True:
                                check=True, timeout=1800)
                 subprocess.run(['rsync', '-a', '-e',
                                 'ssh -o BatchMode=yes -o ConnectTimeout=15',
-                                'cs-cluster:' + deployment['remote_source'] + '/scheduler.log',
+                                'cs-cluster:' + remote_log,
                                 str(destination / 'scheduler.log')], check=True, timeout=120)
                 if state['status'] == 'failed':
                     record('remote_failed_logs_copied', remote_status=state)

@@ -8,8 +8,13 @@ On `cs-cluster`, change to the project root under `/SAN/`, with the source,
 FID weights in `assets/`, and the verified CIFAR-10 archive in `data/`:
 
 ```bash
-qsub -P aihub_ucl -o scheduler.log scripts/cs_cluster/run_cifar_h100.sh
+qsub -P aihub_ucl scripts/cs_cluster/run_cifar_h100.sh
 ```
+
+The merged scheduler log is written to the home directory as
+`/home/zongchen/cifar_ddpmpp_ema.o<JOB_ID>`, using the number returned by `qsub`.
+
+This default applies to new submissions. An explicit `qsub -o` overrides it.
 
 The default Python environment is
 `/home/zongchen/miniconda3/envs/mmd_flow/bin/python`. To select another existing
@@ -27,7 +32,10 @@ python scripts/cs_cluster/sync_cifar_h100.py path/to/deployment.json
 ```
 
 The deployment JSON contains `job_id`, `remote_source`, `remote_output`, and
-`local_output`. The watcher uses the `cs-cluster` SSH alias, copies available
+`local_output`. For new submissions, also set `remote_log` to
+`/home/zongchen/cifar_ddpmpp_ema.o<JOB_ID>`. Older deployment records without this
+field retain their original `remote_source/scheduler.log` location.
+The watcher uses the `cs-cluster` SSH alias, copies available
 outputs every 300 seconds, and verifies final artifact hashes after completion.
 The interval can be changed with `--interval SECONDS`. While training continues,
 copied outputs are marked `partial_synced` in `transfer_status.json`.

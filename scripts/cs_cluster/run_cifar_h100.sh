@@ -7,6 +7,7 @@
 #$ -pe gpu 1
 #$ -l tmem=32G,h_rt=48:00:00,gpu=true,gpu_type=h100
 #$ -j y
+#$ -o /home/zongchen/
 set -euo pipefail
 [[ "$PWD" == /SAN/* ]] || { echo 'Submit from the SAN source snapshot.' >&2; exit 1; }
 export PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
