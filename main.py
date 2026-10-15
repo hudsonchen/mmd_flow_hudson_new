@@ -44,7 +44,8 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
                    optimizer: torch.optim.Optimizer, chunk_size: int, *,
                    objective: str = "riesz", tau_list: tuple[float, ...] = (0.2, 0.05, 0.02),
                    normalize_per_temperature: bool = True,
-                   multiscale_options: dict | None = None) -> dict:
+                   multiscale_options: dict | None = None,
+                   target_options: dict | None = None) -> dict:
     """Backpropagate the chosen particle-field rule through the generator.
 
     Ordinary Riesz uses the exact half-MMD image gradient -velocity/N.
@@ -54,14 +55,20 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
     optimizer.zero_grad(set_to_none=True)
     images = model(latent)
     diagnostics = {}
-    if multiscale_options is None:
+    if multiscale_options is None and target_options:
+        from target_updates import softmax_target_loss
+        loss, diagnostics = softmax_target_loss(
+            images, target, tau_list=tau_list,
+            normalize_per_temperature=normalize_per_temperature, **target_options)
+        loss.backward()
+    elif multiscale_options is None:
         backpropagate_objective(images, target, chunk_size, objective=objective,
                                 tau_list=tau_list, normalize_per_temperature=normalize_per_temperature)
     else:
         loss, diagnostics = multiscale_loss(
             images, target, chunk_size=chunk_size, objective=objective,
             tau_list=tau_list, normalize_per_temperature=normalize_per_temperature,
-            **multiscale_options)
+            target_options=target_options, **multiscale_options)
         loss.backward()
     optimizer.step()
     return diagnostics
@@ -123,6 +130,14 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--global-loss-weight", type=float, default=1.0)
     parser.add_argument("--coarse-loss-weight", type=float, default=1.0)
     parser.add_argument("--patch-loss-weight", type=float, default=1.0)
+    parser.add_argument("--field-step", type=float, default=1.0,
+                        help="Step size in the detached softmax regression target")
+    parser.add_argument("--noise-levels", type=float, nargs='+', default=[0.0],
+                        help="Gaussian standard deviations in each pixel view; losses are averaged")
+    parser.add_argument("--checkpoint-every", type=int, default=0,
+                        help="Save a resumable latest checkpoint every N iterations; 0 disables")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="Resume the same output directory from its latest checkpoint")
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--save-snapshots", type=int, default=None,
                         help="Save this many evenly spaced intervals plus initialization; overrides save-every")
@@ -132,6 +147,13 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    if (not math.isfinite(args.field_step) or args.field_step <= 0 or
+            args.checkpoint_every < 0 or
+            any(not math.isfinite(s) or s < 0 for s in args.noise_levels)):
+        parser.error("invalid field step, noise levels, or checkpoint interval")
+    if args.objective != 'softmax-riesz' and (
+            args.field_step != 1 or args.noise_levels != [0.0]):
+        parser.error("target-update experiments require --objective softmax-riesz")
     if args.fid_samples < 2 or args.fid_batch_size < 1:
         parser.error("FID needs at least two samples and a positive batch size")
     if args.learning_rate is None:
@@ -211,8 +233,14 @@ def main(default_dataset: str = "cifar10") -> None:
     target = train[train_ids].to(device=device, dtype=torch.float32) / 255
     heldout = test[test_ids].to(device=device, dtype=torch.float32) / 255
     # Evaluation identities stay fixed; training uses independent fresh latents.
-    eval_latent = torch.randn((args.particles, args.latent_dim), generator=rng).to(device)
+    eval_latent = torch.randn((args.particles, args.latent_dim),
+                             generator=torch.Generator().manual_seed(args.seed + 4)).to(device)
     train_latent_rng = torch.Generator().manual_seed(args.seed + 1)
+    noise_rng = torch.Generator(device=device).manual_seed(args.seed + 3)
+    target_options = None
+    if args.field_step != 1 or args.noise_levels != [0.0]:
+        target_options = dict(field_step=args.field_step,
+                              noise_levels=args.noise_levels, noise_rng=noise_rng)
     multiscale_options = None
     if args.multiscale_loss:
         multiscale_options = dict(
@@ -227,9 +255,14 @@ def main(default_dataset: str = "cifar10") -> None:
     evaluation_model = ema_model if ema_model is not None else model
     x = evaluation_images(evaluation_model, eval_latent)
     args.output.mkdir(parents=True, exist_ok=True)
-    if (args.output / "config.json").exists():
+    if (args.output / "config.json").exists() and args.resume is None:
         raise FileExistsError(f"Existing run in {args.output}; choose a fresh --output")
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    config.update(evaluation_latent_seed=args.seed + 4,
+                  target_update="drifting_style_stop_gradient_fixed_point_regression",
+                  noise_sampling_seed=args.seed + 3,
+                  noise_geometry="independent_gaussian_per_view_no_clipping",
+                  target_regression_scaling="anchor_batch_scale")
     unit = "epoch" if args.epochs is not None else "step"
     total_iterations = args.epochs if unit == "epoch" else args.steps
     batch_size = args.target_batch_size or len(target)
@@ -296,7 +329,8 @@ def main(default_dataset: str = "cifar10") -> None:
                       fid_weights_sha256=hashlib.sha256(WEIGHTS.read_bytes()).hexdigest(),
                       fid_preprocessing="float [0,1]; bilinear 299x299 align_corners=False; scale to [-1,1]",
                       diagnostic_metric="biased_empirical_riesz_mmd_squared")
-    (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    if args.resume is None:
+        (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     (args.output / "data_indices.json").write_text(json.dumps(
         {"train_indices": train_ids.tolist(), "test_indices": test_ids.tolist()}) + "\n")
     save_grid(target, args.output / "target.png", image_shape=image_shape)
@@ -304,22 +338,88 @@ def main(default_dataset: str = "cifar10") -> None:
     eval_train = target[:args.eval_size]
     train_yy = mean_distance(eval_train, eval_train, args.chunk_size)
     test_yy = mean_distance(heldout, heldout, args.chunk_size)
-    started = time.monotonic()
     save_iterations = set(config["snapshot_iterations"])
     trajectory_states, trajectory_iterations, history = [], [], []
     update_count = 0
     fid_history = []
     training_stats, training_updates = {}, 0
     loss_names = ('global', 'coarse', 'patch', 'combined') if args.multiscale_loss else ()
+    start_iteration, elapsed_offset = 0, 0.0
+    if args.resume is not None:
+        if not (args.output / 'config.json').exists():
+            raise ValueError('Resume requires the original output directory and config.json')
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        ignored = {'resume', 'threads', 'device', 'checkpoint_every'}
+        for key, value in vars(args).items():
+            value = str(value) if isinstance(value, Path) else value
+            if key not in ignored and checkpoint['arguments'].get(key) != value:
+                raise ValueError(f'Resume configuration mismatch for {key}')
+        model.load_state_dict(checkpoint['model'])
+        if ema_model is not None:
+            ema_model.load_state_dict(checkpoint['ema_model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        torch.set_rng_state(checkpoint['torch_rng'])
+        if device == 'cuda':
+            torch.cuda.set_rng_state_all(checkpoint['cuda_rng'])
+        rng.set_state(checkpoint['data_rng'])
+        train_latent_rng.set_state(checkpoint['latent_rng'])
+        noise_rng.set_state(checkpoint['noise_rng'])
+        if multiscale_options is not None:
+            multiscale_options['patch_rng'].set_state(checkpoint['patch_rng'])
+        start_iteration = checkpoint['iteration'] + 1
+        update_count = checkpoint['update_count']
+        history, fid_history = checkpoint['history'], checkpoint['fid_history']
+        trajectory_states = checkpoint['trajectory_states']
+        trajectory_iterations = checkpoint['trajectory_iterations']
+        elapsed_offset = checkpoint['elapsed_seconds']
+        # Remove rows written after the last durable checkpoint before appending.
+        with (args.output / 'metrics.csv').open(newline='') as previous:
+            rows = list(csv.reader(previous))
+        with (args.output / 'metrics.csv').open('w', newline='') as previous:
+            csv.writer(previous).writerows(
+                [rows[0]] + [r for r in rows[1:] if int(r[0]) < start_iteration])
+        if fid_evaluator is not None:
+            (args.output / 'fid_metrics.json').write_text(json.dumps(
+                [{'iteration': i, 'fid': f} for i, f in fid_history], indent=2) + '\n')
+        # The loop below starts with evaluation; perform the pending epoch first.
+        resume_training = start_iteration <= total_iterations
+    else:
+        resume_training = False
+
+    def train_iteration():
+        nonlocal update_count, training_stats, training_updates
+        batches = (epoch_batches(len(target), batch_size, rng) if unit == 'epoch'
+                   else [torch.randperm(len(target), generator=rng)[:batch_size]])
+        training_stats, training_updates = {}, 0
+        for ids in batches:
+            batch = target[ids.to(device)]
+            train_latent = torch.randn((args.particles, args.latent_dim),
+                                       generator=train_latent_rng).to(device)
+            step_diagnostics = generator_step(
+                model, train_latent, batch, optimizer, args.chunk_size,
+                objective=args.objective, tau_list=tuple(args.tau_list),
+                normalize_per_temperature=args.normalize_per_temperature,
+                multiscale_options=multiscale_options, target_options=target_options)
+            for name, value in step_diagnostics.items():
+                training_stats[name] = training_stats.get(name, 0) + float(value)
+            training_updates += 1
+            if ema_model is not None:
+                update_ema(model, ema_model, args.ema_decay)
+            update_count += 1
+
+    started = time.monotonic()
+    if resume_training:
+        train_iteration()
     print(f"Neural {args.objective}: {config['architecture']}, {config['parameter_count']} parameters, "
           f"{len(x)} generated particles, {len(target)} targets, {device}", flush=True)
-    with (args.output / "metrics.csv").open("w", newline="") as stream:
+    with (args.output / "metrics.csv").open("a" if args.resume else "w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
-                         "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
-                        + (["fid"] if fid_evaluator is not None else [])
-                        + [f'train_{name}_surrogate' for name in loss_names])
-        for iteration in range(total_iterations + 1):
+        if args.resume is None:
+            writer.writerow(["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
+                             "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
+                            + (["fid"] if fid_evaluator is not None else [])
+                            + [f'train_{name}_surrogate' for name in loss_names])
+        for iteration in range(start_iteration, total_iterations + 1):
             if iteration > 0:
                 x = evaluation_images(evaluation_model, eval_latent)
                 if not torch.isfinite(x).all():
@@ -347,7 +447,7 @@ def main(default_dataset: str = "cifar10") -> None:
                     speed = velocity(x, eval_train, args.chunk_size).square().mean().sqrt().item()
                 writer.writerow([iteration, iteration if unit == "epoch" else "", update_count,
                                  train_mmd, test_mmd, speed,
-                                 x.min().item(), x.max().item(), time.monotonic() - started]
+                                 x.min().item(), x.max().item(), elapsed_offset + time.monotonic() - started]
                                 + ([fid_value] if fid_evaluator is not None else [])
                                 + [float(training_stats[name]) / training_updates
                                    if name in training_stats else '' for name in loss_names])
@@ -362,27 +462,26 @@ def main(default_dataset: str = "cifar10") -> None:
                 save_trajectory(trajectory_states, trajectory_iterations, args.output,
                                 args.trajectory_particles, unit)
                 plot_mmd(history, args.output, unit, fid_history=fid_history)
+            if args.checkpoint_every and (iteration % args.checkpoint_every == 0 or iteration == total_iterations):
+                checkpoint = dict(
+                    config=config,
+                    arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                    iteration=iteration, update_count=update_count,
+                    model=model.state_dict(), ema_model=ema_model.state_dict() if ema_model else None,
+                    optimizer=optimizer.state_dict(), torch_rng=torch.get_rng_state(),
+                    cuda_rng=torch.cuda.get_rng_state_all() if device == 'cuda' else [],
+                    data_rng=rng.get_state(), latent_rng=train_latent_rng.get_state(),
+                    noise_rng=noise_rng.get_state(),
+                    patch_rng=multiscale_options['patch_rng'].get_state() if multiscale_options else None,
+                    history=history, fid_history=fid_history, trajectory_states=trajectory_states,
+                    trajectory_iterations=trajectory_iterations,
+                    elapsed_seconds=elapsed_offset + time.monotonic() - started)
+                temporary = args.output / 'checkpoint_latest.pt.tmp'
+                torch.save(checkpoint, temporary)
+                temporary.replace(args.output / 'checkpoint_latest.pt')
             if iteration == total_iterations:
                 break
-            if unit == "epoch":
-                batches = epoch_batches(len(target), batch_size, rng)
-            else:
-                batches = [torch.randperm(len(target), generator=rng)[:batch_size]]
-            training_stats, training_updates = {}, 0
-            for ids in batches:
-                batch = target[ids.to(device)]
-                train_latent = torch.randn((args.particles, args.latent_dim),
-                                           generator=train_latent_rng).to(device)
-                step_diagnostics = generator_step(model, train_latent, batch, optimizer, args.chunk_size,
-                               objective=args.objective, tau_list=tuple(args.tau_list),
-                               normalize_per_temperature=args.normalize_per_temperature,
-                               multiscale_options=multiscale_options)
-                for name, value in step_diagnostics.items():
-                    training_stats[name] = training_stats.get(name, 0) + value
-                training_updates += 1
-                if ema_model is not None:
-                    update_ema(model, ema_model, args.ema_decay)
-                update_count += 1
+            train_iteration()
     print(f"Finished. Results: {args.output.resolve()}")
 
 

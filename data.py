@@ -85,8 +85,7 @@ CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
 def download_cifar10(root: Path) -> Path:
     archive = root / 'CIFAR10' / 'raw' / CIFAR10_FILENAME
     candidates = [archive, archive.with_name('cifar-10-python.tar.gz'),
-                  root / 'cifar-10-python.tar.gz',
-                  Path.home() / '.cache' / 'torch' / 'vision' / 'cifar-10-python.tar.gz']
+                  root / 'cifar-10-python.tar.gz']
     for candidate in candidates:
         if candidate.exists() and hashlib.md5(candidate.read_bytes()).hexdigest() == CIFAR10_ARCHIVES[candidate.name]:
             return candidate

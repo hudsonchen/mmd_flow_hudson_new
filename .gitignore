@@ -1,6 +1,9 @@
 # Generated experiment outputs and downloaded datasets
 /results/
 /data/
+/figures/
+/notebooks/
+/assets/
 /datasets/
 /cifar-10-*.tar.gz
 

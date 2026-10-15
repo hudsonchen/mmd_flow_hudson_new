@@ -4,8 +4,12 @@
 softmax Riesz, EMA 0.999, and a 2,000-epoch budget. It requests one H100,
 32 GB host memory, 48 hours, and the `aihub_ucl` project.
 
-On `cs-cluster`, change to `/home/zongchen/mmd_flow_hudson_new`, with the source,
-FID weights in `assets/`, and the verified CIFAR-10 archive in `data/`:
+On `cs-cluster`, change to `/home/zongchen/mmd_flow_hudson_new`, with the source
+and FID weights in `assets/`. The default dataset root is
+`/SAN/intelsys/imagenet_mmd_flow/data`; the CIFAR-10 archive lives at
+`CIFAR10/raw/cifar-10-python.tar.gz` beneath that root (the binary archive is
+also supported). Override it with
+`qsub -v DATA_ROOT=/absolute/data/path` if needed:
 
 ```bash
 cd /home/zongchen/mmd_flow_hudson_new
@@ -54,3 +58,78 @@ The interval can be changed with `--interval SECONDS`. While training continues,
 copied outputs are marked `partial_synced` in `transfer_status.json`.
 
 Existing submitted jobs keep their original source snapshots and script paths.
+
+## Parallel 500-epoch single-factor comparison
+
+From a project root containing the updated Python sources and `assets/`, submit:
+
+```bash
+qsub scripts/cs_cluster/run_cifar_ablation_h100.sh
+```
+
+This is an SGE array (`-t 1-8`), with one H100 per task and no concurrency cap or
+job dependencies. All tasks can run simultaneously, subject to available H100s
+and scheduler/project limits. Each task requests 32 GB host memory and 24 hours.
+The array has not been submitted by Codex.
+
+| Task | Variant | Only experimental change from control |
+| --- | --- | --- |
+| 1 | `control` | None |
+| 2 | `lr_1e4` | Adam learning rate 0.0001 |
+| 3 | `lr_5e5` | Adam learning rate 0.00005 |
+| 4 | `particles128` | 128 interacting generated samples per update |
+| 5 | `global4` | Global/coarse/patch weights 4:1:1 |
+| 6 | `no_patch` | Patch-group weight 0, retaining global and coarse |
+| 7 | `noise` | Average losses at Gaussian noise std 0, 0.05, 0.15 |
+| 8 | `explicit_h01` | Explicit detached-target field step 0.1 |
+
+All tasks use the same DDPM++ one-pass generator, softmax Riesz temperatures
+`[0.2, 0.05, 0.02]`, per-temperature RMS normalization, EMA 0.999, real batch
+256, seed 0, and 500 full passes through 50,000 real training examples
+(98,000 optimizer updates). The control learning rate is 0.0002 and generated
+population is 64. No feature encoder or conditioning is added.
+
+All tasks save FID-10K, sample grids, and a resumable `checkpoint_latest.pt` every
+20 epochs, including the final epoch. FID always evaluates clean EMA samples
+against the full CIFAR-10 training set, using the same latent seed. Evaluation
+latents have their own RNG so changing diagnostic population size does not
+change the training data permutation. Use this fresh control for comparisons;
+older jobs shared the diagnostic-latent RNG with data shuffling.
+
+Noise is added independently to real and generated pixels *after constructing
+each view*, without clipping, using a separate RNG. These are noise-averaged
+distribution losses, not a noise-conditioned network.
+
+All tasks retain the existing Drifting-style fixed-point regression: construct
+the stop-gradient target as current scaled output plus the sum of the three
+per-temperature normalized fields, then regress the generator toward it.
+There is no implicit numerical solver. Task 8 scales that field by 0.1; this
+rescales the gradient, which Adam largely compensates, so it need not behave
+like lowering Adam's learning rate.
+
+Outputs live under `results/cifar/ablation500_<JOB_ID>_<TASK_ID>_<VARIANT>/`.
+Each task runs its own source copy in `source/`, records source hashes, and
+writes `job_status.json` and `run.log`. Scheduler logs go to
+`/home/zongchen/cifar_ablation.o<JOB_ID>.<TASK_ID>`. Completion checks require
+501 metric rows, 26 FID evaluations, 98,000 updates, and a final checkpoint;
+successful completion also writes SHA-256 hashes in `artifact_manifest.json`.
+The existing single-job transfer watcher is not an array-task watcher.
+
+Inspect a task's command without submitting or creating output:
+
+```bash
+SGE_TASK_ID=8 bash scripts/cs_cluster/run_cifar_ablation_h100.sh --dry-run
+```
+
+To resume an interrupted task, use its recorded command with the saved
+`source/main.py`, the same output and experiment arguments, and append
+`--resume /absolute/output/path/checkpoint_latest.pt`. Checkpoints retain raw
+and EMA weights, Adam state, RNGs, and plotting/metric history. Only the latest
+checkpoint is retained. Resume rejects changed experimental settings.
+
+Local CPU checks:
+
+```bash
+DRIFT_COMPILE=0 python -m unittest discover -s tests -v
+bash -n scripts/cs_cluster/run_cifar_ablation_h100.sh
+```

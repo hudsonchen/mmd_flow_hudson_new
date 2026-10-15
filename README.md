@@ -44,6 +44,9 @@ The launcher uses the `mmd_flow_hudson` environment and requires CUDA.
 `DATASET`, `ARCHITECTURE`, `OBJECTIVE`, `PARTICLES`, `EPOCHS`, `BATCH_SIZE`,
 `SAVE_EVERY`, `BASE_CHANNELS`, `NUM_RES_BLOCKS`, `LATENT_DIM`, `LEARNING_RATE`, `SEED`,
 `DATA_ROOT`, `PYTHON`, and `OUTPUT` are configurable shell variables.
+The local data root defaults to `/home/zongchen/data`. CIFAR-10 is loaded from
+`/home/zongchen/data/CIFAR10/raw/cifar-10-python.tar.gz`; the loader also accepts
+the binary archive in the same directory. Set `DATA_ROOT` to use another root.
 `EMA_DECAY` defaults to 0.999 for CIFAR-10 and 0 for MNIST; 0 disables EMA.
 After each optimizer update, EMA weights are updated from the live training
 weights. FID, MMD diagnostics, sample grids, and trajectories use EMA weights

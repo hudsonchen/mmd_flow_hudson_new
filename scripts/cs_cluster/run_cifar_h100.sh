@@ -11,7 +11,7 @@
 set -euo pipefail
 [[ -f "$PWD/main.py" && -f "$PWD/run.sh" ]] || { echo 'Submit from the project root containing main.py and run.sh.' >&2; exit 1; }
 export PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
-export DATA_ROOT="$PWD/data"
+export DATA_ROOT="${DATA_ROOT:-/SAN/intelsys/imagenet_mmd_flow/data}"
 MULTISCALE_LOSS="${MULTISCALE_LOSS:-0}"
 export MULTISCALE_LOSS
 LOSS_NAME=""

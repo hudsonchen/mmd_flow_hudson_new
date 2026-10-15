@@ -89,6 +89,7 @@ def _riesz_topk_softmax_loss_impl(
     rms_epsilon: float = 1e-8,
     direction_epsilon: float = 1e-8,
     normalize_per_temperature: bool = False,
+    return_field: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Regress toward the detached, RMS-normalized softmax Riesz velocity.
 
@@ -263,6 +264,8 @@ def _riesz_topk_softmax_loss_impl(
         ).mean().detach(),
     }
     info.update(_temperature_metrics(temperatures, per_temperature_rms))
+    if return_field:
+        info.update(frozen_velocity=frozen_velocity, scale_inputs=scale_inputs)
     if len(temperatures) == 1:
         info["riesz_topk_softmax_tau"] = torch.tensor(
             temperatures[0], device=gen.device

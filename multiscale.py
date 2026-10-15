@@ -6,9 +6,15 @@ from loss import _riesz_topk_softmax_loss_impl, velocity
 
 
 def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
-                        normalize_per_temperature):
+                        normalize_per_temperature, target_options=None):
     target = target.detach()
     if objective == 'softmax-riesz':
+        if target_options:
+            from target_updates import softmax_target_loss
+            value, _ = softmax_target_loss(
+                features, target, tau_list=tau_list,
+                normalize_per_temperature=normalize_per_temperature, **target_options)
+            return value
         # Preserve upstream's batch-distance and per-coordinate normalization.
         value, _ = _riesz_topk_softmax_loss_impl(
             features.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list,
@@ -27,7 +33,8 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                     objective='softmax-riesz', tau_list=(0.2, 0.05, 0.02),
                     normalize_per_temperature=True, coarse_sizes=(8, 16),
                     patch_sizes=(7, 14), crops_per_size=1, patch_rng=None,
-                    global_weight=1.0, coarse_weight=1.0, patch_weight=1.0):
+                    global_weight=1.0, coarse_weight=1.0, patch_weight=1.0,
+                    target_options=None):
     """Return a weighted loss and detached group diagnostics.
 
     Crop coordinates are shared across generated/real populations, without
@@ -50,7 +57,8 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
     def loss(x, y):
         return objective_surrogate(x.flatten(1), y.flatten(1), chunk_size,
                                    objective=objective, tau_list=tau_list,
-                                   normalize_per_temperature=normalize_per_temperature)
+                                   normalize_per_temperature=normalize_per_temperature,
+                                   target_options=target_options)
 
     groups = {}
     if global_weight:
