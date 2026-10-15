@@ -2,7 +2,7 @@
 import math
 import torch
 from torch.nn import functional as F
-from loss import _riesz_topk_softmax_loss_impl, velocity
+from loss import _riesz_topk_softmax_loss_impl, velocity, drifting_loss, sinkhorn_target_loss
 
 
 def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
@@ -11,13 +11,15 @@ def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
                         diagnostics=None):
     target = target.detach()
     if objective == 'sinkhorn':
-        from sinkhorn import sinkhorn_target_loss
         value, info = sinkhorn_target_loss(
             features, target, reference, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
         if diagnostics is not None:
             for name, result in info.items():
                 diagnostics.setdefault(name, []).append(result)
         return value
+    if objective == 'drifting':
+        value, _ = drifting_loss(features.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list)
+        return value.mean()
     if objective == 'softmax-riesz':
         if target_options:
             from target_updates import softmax_target_loss

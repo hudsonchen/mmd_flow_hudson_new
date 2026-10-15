@@ -1,7 +1,7 @@
 # Neural Riesz image generation
 
 One shared trainer generates MNIST or CIFAR-10 images from fresh Gaussian
-noise using either ordinary Riesz MMD or softmax Riesz. Training updates only
+noise using ordinary Riesz MMD, softmax Riesz, Drifting, or Sinkhorn. Training updates only
 network parameters. Fixed, independent evaluation inputs track the same sample
 identities across epochs.
 
@@ -12,7 +12,8 @@ main.py          CLI, training loop, optimizer, experiment configuration
 fid.py           CIFAR-10 FID evaluation of generators or saved NumPy samples
 assets/          pretrained FID Inception weights, checksum, and license
 backbone.py      MLP, compact MNIST U-Net, larger CIFAR RGB attention U-Net
-loss.py          ordinary Riesz fields/MMD and softmax Riesz loss
+loss.py          Riesz fields/MMD, softmax Riesz, Drifting, and Sinkhorn losses
+sinkhorn.py      compatibility imports from loss.py
 multiscale.py    coarse-image and aligned-patch training objectives
 data.py         verified dataset downloads and both dataset loaders
 visualization.py shared image grids, trajectories, and MMD plots
@@ -167,10 +168,46 @@ field is RMS-normalized before summation, then the generator regresses toward
 a detached goal in batch-scaled coordinates. `--tau-list` controls temperatures;
 `--no-normalize-per-temperature` selects upstream's combined-field normalization.
 
-`loss.backpropagate_objective` dispatches both training rules. Softmax Riesz's
+`loss.backpropagate_objective` dispatches the Riesz and Drifting training rules. Softmax Riesz's
 regression surrogate is distinct from the ordinary Riesz energy. Both are
 used in raw pixel space with no feature encoder or CFG fixed negatives.
 Finite Adam/minibatch steps need not decrease MMD monotonically.
+
+### Official Drifting loss without a feature encoder
+
+Select `--objective drifting`, or `OBJECTIVE=drifting bash run.sh`.
+This ports the [official JAX loss](https://github.com/lambertae/drifting/blob/8861066430db11d2fb0858d042c7845b99df49f1/drift_loss.py)
+to PyTorch in `loss.drifting_loss` (also available as `loss.drift_loss`).
+The upstream revision/hash are recorded in the source and run configuration;
+its MIT license is retained in `DRIFTING_LICENSE.txt`.
+
+The loss uses the geometric mean of row and column softmax affinities over
+joint generated/real support, balances attraction and repulsion using their
+opposite population's affinity mass, and uses displacement vectors directly.
+It preserves the official distance floor, finite self-distance mask, affinity
+floor, batch coordinate scaling, per-temperature RMS normalization, and detached
+regression target. Optional weighted positives and fixed negatives are supported
+by the loss API. `--tau-list` selects temperatures; per-temperature normalization
+is always enabled for Drifting.
+
+The trainer applies this loss directly to pixels, without a feature encoder.
+`--multiscale-loss` optionally applies it to the existing pooled images and aligned
+patches too. This is the official loss within our generator/training setup, rather
+than the full ImageNet training recipe: pretrained MAE features, class conditioning,
+and sample queues are not added. The published ImageNet models use pretrained
+feature encoders, including for pixel-output generation, so changing the loss
+alone does not reproduce those results.
+
+```bash
+OBJECTIVE=drifting MULTISCALE_LOSS=1 bash run.sh
+```
+
+### Sinkhorn implementation
+
+`loss.py` also owns `sinkhorn_plan`, `sinkhorn_barycenter`, and
+`sinkhorn_target_loss`. The two-independent-generated-batch W-Flow rule and its
+normalization are unchanged. `--objective sinkhorn` selects it; `sinkhorn.py`
+retains compatibility imports for existing callers.
 
 ## Data and outputs
 

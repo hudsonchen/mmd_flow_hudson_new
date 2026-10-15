@@ -1,5 +1,33 @@
 # CIFAR-10 on cs-cluster
 
+## Drifting and Sinkhorn with released B-model hyperparameters
+
+`run_cifar_official_b_h100.sh` launches a two-task H100 array: task 1 is
+Drifting and task 2 is Sinkhorn. Both use 64 generated / 64 real particles,
+AdamW with betas (0.9, 0.95), LR 0.0004, 10,000-update warmup from 1e-6,
+gradient clipping at 2, EMA 0.999, seed 42, and 200,000 optimizer updates.
+Sinkhorn adds an independent 64-particle generated support with epsilon 0.05
+and 10 quadratic-cost Sinkhorn iterations; Drifting uses temperatures
+[0.2, 0.05, 0.02]. Both use a unit normalized-field target step.
+
+The releases have no CIFAR-10 configs. These runs retain the existing CIFAR
+DDPM++ network and multiscale pixel views. See
+[the saved reference configs and adaptation boundaries](../../configs/official_reference/README.md)
+for the differences from the official conditional ImageNet training recipe.
+
+Submit from a staged project root with `assets/` available:
+
+```bash
+qsub scripts/cs_cluster/run_cifar_official_b_h100.sh
+```
+
+Each task requests one H100 for 48 hours and writes a source snapshot,
+`config.json`, `job_status.json`, and `run.log` to
+`results/cifar/officialB_cifar_<JOB_ID>_<TASK_ID>_<OBJECTIVE>/` in the main
+cluster checkout. FID-10K runs every 5,000 updates; the latest resumable
+checkpoint is saved every 2,000 updates. Scheduler logs are
+`/home/zongchen/cifar_official_b.o<JOB_ID>.<TASK_ID>`.
+
 `run_cifar_h100.sh` launches the CIFAR-10 DDPM++ one-pass generator with
 softmax Riesz, EMA 0.999, and a 2,000-epoch budget. It requests one H100,
 32 GB host memory, 48 hours, and the `aihub_ucl` project.

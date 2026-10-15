@@ -49,15 +49,15 @@ if [[ "${1:-}" == --dry-run ]]; then
     exit 0
 fi
 [[ $# == 0 ]] || { echo 'Only --dry-run is supported' >&2; exit 2; }
-[[ -f "$PROJECT_ROOT/main.py" && -f "$PROJECT_ROOT/target_updates.py" && -f "$PROJECT_ROOT/sinkhorn.py" ]] || {
-    echo 'Submit from the project root containing main.py, target_updates.py and sinkhorn.py' >&2; exit 2;
+[[ -f "$PROJECT_ROOT/main.py" && -f "$PROJECT_ROOT/target_updates.py" && -f "$PROJECT_ROOT/loss.py" ]] || {
+    echo 'Submit from the project root containing main.py, target_updates.py and loss.py' >&2; exit 2;
 }
 [[ ! -e "$OUTPUT" ]] || { echo "Output already exists: $OUTPUT" >&2; exit 2; }
 [[ -x "$PYTHON" && -d "$PROJECT_ROOT/assets" ]] || { echo 'Missing Python environment or assets' >&2; exit 2; }
 mkdir -p "$SOURCE"
 # Run an immutable per-task source copy; assets remain shared and read-only.
 cp "$PROJECT_ROOT/"*.py "$SOURCE/"
-cp "$PROJECT_ROOT/WFLOW_LICENSE.txt" "$SOURCE/"
+cp "$PROJECT_ROOT/WFLOW_LICENSE.txt" "$PROJECT_ROOT/DRIFTING_LICENSE.txt" "$SOURCE/"
 ln -s "$PROJECT_ROOT/assets" "$SOURCE/assets"
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 PYTHONUNBUFFERED=1
 export EXPERIMENT_OUTPUT="$OUTPUT" EXPERIMENT_VARIANT="$VARIANT"

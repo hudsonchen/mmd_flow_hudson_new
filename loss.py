@@ -2,11 +2,12 @@
 # Revision: 777d696f31340a1370f5b39a2e7d000464b10526
 # Upstream SHA256: a64f0a97e8ae4998cec7e72b8fff7bae27563467c1a4f75acb6d2307455dd578
 # License: see SOFTMAX_RIESZ_LICENSE.txt
-"""Ordinary Riesz MMD and vendored softmax Riesz particle-field losses."""
+"""Riesz, Drifting, and two-batch Sinkhorn detached-target losses."""
 
 from __future__ import annotations
 
 import os
+import math
 from typing import Dict, Iterable, Tuple
 
 import torch
@@ -328,7 +329,10 @@ def mmd_squared(x: torch.Tensor, y: torch.Tensor, yy: float, chunk_size: int) ->
 def backpropagate_objective(images, target, chunk_size, *, objective="riesz",
                             tau_list=(0.2, 0.05, 0.02), normalize_per_temperature=True):
     """Apply the chosen image-output gradient without changing its scaling."""
-    if objective == "softmax-riesz":
+    if objective == "drifting":
+        loss, _ = drifting_loss(images.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list)
+        loss.mean().backward()
+    elif objective == "softmax-riesz":
         loss, _ = _riesz_topk_softmax_loss_impl(
             images.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list,
             normalize_per_temperature=normalize_per_temperature, epsilon=1e-6)
@@ -337,3 +341,150 @@ def backpropagate_objective(images, target, chunk_size, *, objective="riesz",
         images.backward(-velocity(images.detach(), target, chunk_size) / len(images))
     else:
         raise ValueError(f"Unknown objective: {objective}")
+
+
+# W-Flow quadratic-cost adaptation; see WFLOW_LICENSE.txt.
+# Reference: https://github.com/hanjq17/W-Flow/blob/main/drift_loss_ot.py
+@torch.no_grad()
+def sinkhorn_plan(source, support, *, epsilon, iterations=10):
+    """Uniform balanced coupling for cost ||x-y||^2/2, with fixed iterations.
+
+    Finite iteration counts need not exactly satisfy both marginals. Return
+    the actual plan so callers can measure this approximation error.
+    """
+    if (source.ndim != 2 or support.ndim != 2 or source.shape[1] != support.shape[1]
+            or not len(source) or not len(support)):
+        raise ValueError('Sinkhorn needs nonempty [particles, dimension] populations')
+    if not math.isfinite(epsilon) or epsilon <= 0 or iterations < 1:
+        raise ValueError('Sinkhorn epsilon and iteration count must be positive')
+    cost = 0.5 * torch.cdist(source, support).square()
+    log_kernel = -cost / epsilon
+    log_a, log_b = -math.log(len(source)), -math.log(len(support))
+    log_v = support.new_zeros(len(support))
+    for _ in range(iterations):
+        log_u = log_a - torch.logsumexp(log_kernel + log_v.unsqueeze(0), dim=1)
+        log_v = log_b - torch.logsumexp(log_kernel + log_u.unsqueeze(1), dim=0)
+    return (log_u.unsqueeze(1) + log_kernel + log_v.unsqueeze(0)).exp()
+
+
+@torch.no_grad()
+def sinkhorn_barycenter(source, support, *, epsilon, iterations=10):
+    plan = sinkhorn_plan(source, support, epsilon=epsilon, iterations=iterations)
+    rows = plan.sum(dim=1, keepdim=True)
+    # Normalize actual row masses, as in the release, rather than assuming
+    # exact convergence after the fixed iteration budget.
+    projected = plan @ support / rows.clamp_min(1e-12)
+    row_error = (rows.flatten() - 1 / len(source)).abs().max()
+    col_error = (plan.sum(dim=0) - 1 / len(support)).abs().max()
+    return projected, torch.maximum(row_error, col_error)
+
+
+def sinkhorn_target_loss(features, target, reference, *, epsilon=0.05, iterations=10):
+    """Regress toward x + T_real(x) - T_independent_generated(x).
+
+    `reference` must be a separately sampled, detached generator population.
+    The two maps share the same batch scale and entropic regularization.
+    This scalar loss is a regression surrogate, not a Sinkhorn energy estimate.
+    """
+    if reference is None:
+        raise ValueError('W-Flow requires an independent generated reference batch')
+    with torch.no_grad():
+        x, y, ref = features.detach().float(), target.detach().float(), reference.detach().float()
+        dimension = x.shape[1]
+        support = torch.cat((x, ref, y))
+        distance_rms = (torch.cdist(x, support).square().mean() / (1 + 1e-8)).sqrt()
+        scale = (distance_rms / math.sqrt(dimension)).clamp_min(1e-3)
+        xs, ys, rs = x / scale, y / scale, ref / scale
+        regularization = epsilon * dimension
+        attraction, real_error = sinkhorn_barycenter(
+            xs, ys, epsilon=regularization, iterations=iterations)
+        repulsion, generated_error = sinkhorn_barycenter(
+            xs, rs, epsilon=regularization, iterations=iterations)
+        velocity = attraction - repulsion
+        velocity_rms = velocity.square().mean().clamp_min(1e-8).sqrt()
+        goal = xs + velocity / velocity_rms
+        if not torch.isfinite(goal).all():
+            raise RuntimeError('Nonfinite Sinkhorn regression target')
+        info = dict(sinkhorn_velocity_raw_rms=velocity.square().mean().sqrt(),
+                    sinkhorn_marginal_max_error=torch.maximum(real_error, generated_error))
+    return (features.float() / scale - goal).square().mean(), info
+
+
+# PyTorch adaptation of the official Drifting loss (MIT; DRIFTING_LICENSE.txt).
+# Reference: https://github.com/lambertae/drifting/blob/main/drift_loss.py
+# Revision: 8861066430db11d2fb0858d042c7845b99df49f1
+# Upstream SHA256: 445ba0485e1d81be81aee4e1d5458d85548db171ecd310c1fc855ea6242bc782
+
+def drifting_loss(gen, fixed_pos, fixed_neg=None, weight_gen=None,
+                  weight_pos=None, weight_neg=None, *,
+                  tau_list=(0.2, 0.05, 0.02), return_field=False):
+    """Official Drifting affinity/force construction on [B, particles, D].
+
+    Joint positive/negative affinities use the geometric mean of row and
+    column softmaxes. Cross-population masses balance attraction and repulsion;
+    displacements are not divided by pairwise distance. Each temperature is
+    RMS-normalized before detached-target regression in scaled coordinates.
+    Retains the release's finite diagonal mask and affinity floor exactly.
+    """
+    temperatures = tuple(float(t) for t in tau_list)
+    if not temperatures or any(not math.isfinite(t) or t <= 0 for t in temperatures):
+        raise ValueError('Drifting temperatures must be finite and positive')
+    if gen.ndim != 3 or min(gen.shape) < 1:
+        raise ValueError('gen must be nonempty [B, particles, D]')
+    if fixed_neg is None:
+        fixed_neg = gen[:, :0].detach()
+    populations = (gen, fixed_neg, fixed_pos)
+    weights = []
+    for population, weight in zip(populations, (weight_gen, weight_neg, weight_pos)):
+        if (population.ndim != 3 or population.shape[0] != gen.shape[0]
+                or population.shape[-1] != gen.shape[-1]):
+            raise ValueError('Populations must share batch and feature dimensions')
+        if weight is None:
+            weight = torch.ones_like(population[..., 0])
+        if weight.shape != population.shape[:2] or not torch.isfinite(weight).all() or (weight < 0).any():
+            raise ValueError('Weights must be finite nonnegative [B, particles] arrays')
+        weights.append(weight.detach().float())
+    if fixed_pos.shape[1] < 1 or not (weights[2].sum(dim=1) > 0).all():
+        raise ValueError('Each batch needs positive target mass')
+    gen = gen.float()
+    with torch.no_grad():
+        anchor = gen.detach()
+        support = torch.cat([anchor, fixed_neg.detach().float(), fixed_pos.detach().float()], dim=1)
+        support_weights = torch.cat(weights, dim=1)
+        # Match the release's sqrt(max(squared_distance, 1e-8)), including collisions.
+        squared = (anchor.square().sum(-1, keepdim=True)
+                   + support.square().sum(-1).unsqueeze(1)
+                   - 2 * torch.bmm(anchor, support.transpose(1, 2)))
+        distances = squared.clamp_min(1e-8).sqrt()
+        scale = (distances * support_weights[:, None]).mean() / support_weights.mean()
+        scale_inputs = (scale / math.sqrt(gen.shape[-1])).clamp_min(1e-3)
+        xs, supports = anchor / scale_inputs, support / scale_inputs
+        distance = distances / scale.clamp_min(1e-3)
+        count = gen.shape[1]
+        mask = torch.zeros_like(distance)
+        mask[:, :, :count] = torch.eye(count, device=gen.device)
+        distance = distance + 100 * mask
+        split = count + fixed_neg.shape[1]
+        field = torch.zeros_like(xs)
+        info = {'scale': scale}
+        for temperature in temperatures:
+            logits = -distance / temperature
+            affinity = (logits.softmax(-1) * logits.softmax(-2)).clamp_min(1e-6).sqrt()
+            affinity = affinity * support_weights[:, None]
+            negative, positive = affinity[:, :, :split], affinity[:, :, split:]
+            coefficients = torch.cat((-negative * positive.sum(-1, keepdim=True),
+                                      positive * negative.sum(-1, keepdim=True)), dim=-1)
+            force = (torch.bmm(coefficients, supports)
+                     - coefficients.sum(-1, keepdim=True) * xs)
+            magnitude = force.square().mean()
+            info[f'drifting_force_squared_tau_{temperature:g}'] = magnitude
+            field = field + force / magnitude.clamp_min(1e-8).sqrt()
+        goal = xs + field
+        info['drifting_velocity_rms'] = field.square().mean().sqrt()
+        if return_field:
+            info.update(frozen_velocity=field, scale_inputs=scale_inputs)
+    return (gen / scale_inputs - goal).square().mean(dim=(-1, -2)), info
+
+
+# Official code uses the shorter spelling.
+drift_loss = drifting_loss

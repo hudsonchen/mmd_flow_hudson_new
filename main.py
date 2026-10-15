@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train one-pass image generators with Riesz objectives on MNIST or CIFAR-10."""
+"""Train one-pass image generators with Riesz, Drifting, or Sinkhorn objectives on MNIST or CIFAR-10."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,8 @@ import torch
 from backbone import build_backbone, backbone_metadata
 from data import (FILES, CIFAR10_ARCHIVES, CIFAR10_CLASSES, download_mnist,
                   download_cifar10, load_dataset, image_shape as dataset_image_shape)
-from loss import backpropagate_objective, mean_distance, mmd_squared, velocity, _riesz_topk_softmax_loss_impl
+from loss import (backpropagate_objective, mean_distance, mmd_squared, velocity,
+                  _riesz_topk_softmax_loss_impl, drifting_loss, sinkhorn_target_loss)
 from visualization import save_grid, save_trajectory, plot_mmd
 from multiscale import multiscale_loss
 
@@ -47,7 +48,8 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
                    multiscale_options: dict | None = None,
                    target_options: dict | None = None,
                    sinkhorn_latent: torch.Tensor | None = None,
-                   sinkhorn_epsilon: float = 0.05, sinkhorn_iters: int = 10) -> dict:
+                   sinkhorn_epsilon: float = 0.05, sinkhorn_iters: int = 10,
+                   max_grad_norm: float = 0.0) -> dict:
     """Backpropagate the chosen particle-field rule through the generator.
 
     Ordinary Riesz uses the exact half-MMD image gradient -velocity/N.
@@ -64,7 +66,6 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
             reference_images = model(sinkhorn_latent)
     diagnostics = {}
     if multiscale_options is None and objective == 'sinkhorn':
-        from sinkhorn import sinkhorn_target_loss
         loss, diagnostics = sinkhorn_target_loss(
             images, target, reference_images, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
         loss.backward()
@@ -85,6 +86,8 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
             sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
             **multiscale_options)
         loss.backward()
+    if max_grad_norm:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     optimizer.step()
     return diagnostics
 
@@ -92,6 +95,13 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
 
 def snapshot_steps(steps: int, intervals: int) -> set[int]:
     return {0, *(math.ceil(steps * index / intervals) for index in range(1, intervals + 1))}
+
+
+def training_learning_rate(update: int, peak: float, warmup_steps: int) -> float:
+    """Released W-Flow/Drifting schedule, indexed by completed updates."""
+    if update < warmup_steps:
+        return 1e-6 + (peak - 1e-6) * update / warmup_steps
+    return peak
 
 
 
@@ -124,6 +134,13 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     duration.add_argument("--steps", type=int, default=None, help="Number of individual updates")
     duration.add_argument("--epochs", type=int, default=None, help="Number of full passes over the target dataset")
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--optimizer", choices=("Adam", "AdamW"), default="Adam")
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                        help="Linear warmup from 1e-6, then constant LR; counted in optimizer updates")
+    parser.add_argument("--max-grad-norm", type=float, default=0.0,
+                        help="Clip parameter gradient norm; 0 disables")
     parser.add_argument("--ema-decay", type=float, default=None,
                         help="EMA decay per optimizer update; default 0.999 for CIFAR, 0 for MNIST; 0 disables")
     parser.add_argument("--architecture", choices=("unet", "mlp"), default="unet")
@@ -132,7 +149,7 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=None,
                         help="Spatial U-Net noise: 784 for MNIST, 3072 for CIFAR-10; MLP: 32")
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 256])
-    parser.add_argument("--objective", choices=("softmax-riesz", "riesz", "sinkhorn"), default="softmax-riesz")
+    parser.add_argument("--objective", choices=("softmax-riesz", "riesz", "sinkhorn", "drifting"), default="softmax-riesz")
     parser.add_argument("--sinkhorn-epsilon", type=float, default=0.05,
                         help="Dimension-relative entropic regularization for quadratic Sinkhorn")
     parser.add_argument("--sinkhorn-iters", type=int, default=10)
@@ -165,12 +182,18 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    if (not 0 <= args.adam_beta2 < 1 or args.warmup_steps < 0
+            or not math.isfinite(args.weight_decay) or args.weight_decay < 0
+            or not math.isfinite(args.max_grad_norm) or args.max_grad_norm < 0):
+        parser.error('Invalid optimizer, warmup, or gradient clipping settings')
     if not math.isfinite(args.sinkhorn_epsilon) or args.sinkhorn_epsilon <= 0 or args.sinkhorn_iters < 1:
         parser.error('Sinkhorn epsilon and iterations must be positive')
     if (not math.isfinite(args.field_step) or args.field_step <= 0 or
             args.checkpoint_every < 0 or
             any(not math.isfinite(s) or s < 0 for s in args.noise_levels)):
         parser.error("invalid field step, noise levels, or checkpoint interval")
+    if args.objective == 'drifting' and not args.normalize_per_temperature:
+        parser.error('The official Drifting loss requires per-temperature normalization')
     if args.objective != 'softmax-riesz' and (
             args.field_step != 1 or args.noise_levels != [0.0]):
         parser.error("target-update experiments require --objective softmax-riesz")
@@ -271,7 +294,9 @@ def main(default_dataset: str = "cifar10") -> None:
             patch_weight=args.patch_loss_weight)
     model = build_backbone(args.dataset, args.architecture, args.latent_dim, args.base_channels,
                            args.hidden_dims, args.num_res_blocks).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = getattr(torch.optim, args.optimizer)(
+        model.parameters(), lr=args.learning_rate, betas=(0.9, args.adam_beta2),
+        weight_decay=args.weight_decay)
     ema_model = copy.deepcopy(model).requires_grad_(False).eval() if args.ema_decay else None
     evaluation_model = ema_model if ema_model is not None else model
     x = evaluation_images(evaluation_model, eval_latent)
@@ -301,12 +326,13 @@ def main(default_dataset: str = "cifar10") -> None:
                                                  args.base_channels, args.hidden_dims, args.num_res_blocks),
                   hidden_activation="SiLU", output_activation="Sigmoid",
                   parameter_count=sum(p.numel() for p in model.parameters()),
-                  training_rule="detached_scaled_velocity_regression" if args.objective in ("softmax-riesz", "sinkhorn")
+                  training_rule="detached_scaled_velocity_regression" if args.objective in ("softmax-riesz", "sinkhorn", "drifting")
                   else "exact_half_mmd_gradient",
                   evaluation_metric="fid" if args.dataset == "cifar10" else "biased_empirical_riesz_mmd_squared",
-                  energy={"softmax-riesz": "softmax_field_surrogate", "sinkhorn": "sinkhorn_velocity_regression_surrogate",
-                          "riesz": "0.5 * biased_empirical_mmd_squared"}[args.objective], optimizer="Adam",
-                  adam_betas=[0.9, 0.999], adam_eps=1e-8, weight_decay=0,
+                  energy={"drifting": "drifting_velocity_regression_surrogate", "softmax-riesz": "softmax_field_surrogate", "sinkhorn": "sinkhorn_velocity_regression_surrogate",
+                          "riesz": "0.5 * biased_empirical_mmd_squared"}[args.objective], optimizer=args.optimizer,
+                  adam_betas=[0.9, args.adam_beta2], adam_eps=1e-8, weight_decay=args.weight_decay,
+                  lr_schedule="linear_warmup_then_constant", warmup_start_lr=1e-6,
                   dataset_md5=FILES if args.dataset == "mnist" else {raw.name: CIFAR10_ARCHIVES[raw.name]},
                   data_source=str(raw.resolve()),
                   image_shape=image_shape, pixel_scaling="uint8_div_255", iteration_unit=unit,
@@ -324,7 +350,7 @@ def main(default_dataset: str = "cifar10") -> None:
                       patch_sampling_seed=args.seed + 2,
                       patch_alignment="shared_coordinates_across_generated_and_real_populations",
                       view_weighting="mean_within_group_then_normalized_group_weights",
-                      view_distance_scaling="upstream_batch_distance_scale" if args.objective in ('softmax-riesz', 'sinkhorn')
+                      view_distance_scaling="upstream_batch_distance_scale" if args.objective in ('softmax-riesz', 'sinkhorn', 'drifting')
                       else "euclidean_distance_divided_by_sqrt_view_dimension",
                       training_loss_diagnostic="mean_over_updates_in_iteration_gradient_surrogates_not_mmd_energy")
     if args.objective == "softmax-riesz":
@@ -336,12 +362,22 @@ def main(default_dataset: str = "cifar10") -> None:
                       softmax_rms_epsilon=1e-8, softmax_feature_space="raw_pixels",
                       softmax_fixed_negatives=False,
                       velocity_diagnostic="normalized_field_in_scaled_pixel_space")
+    elif args.objective == 'drifting':
+        config.update(kernel='joint_row_column_softmax_geometric_mean',
+                      drifting_reference_code='https://github.com/lambertae/drifting/blob/main/drift_loss.py',
+                      drifting_module_sha256=hashlib.sha256(Path(__file__).with_name('loss.py').read_bytes()).hexdigest(),
+                      drifting_source_revision='8861066430db11d2fb0858d042c7845b99df49f1',
+                      drifting_source_sha256='445ba0485e1d81be81aee4e1d5458d85548db171ecd310c1fc855ea6242bc782',
+                      drifting_feature_space='raw_pixel_views_no_encoder',
+                      drifting_affinity_floor=1e-6, drifting_diagonal_distance_mask=100.0,
+                      drifting_normalization='per_temperature_rms_floor_squared_1e-8',
+                      velocity_diagnostic='drifting_normalized_field_in_scaled_pixel_space')
     elif args.objective == 'sinkhorn':
         config.update(kernel="entropic_quadratic_transport", power=2,
                       sinkhorn_paper="https://arxiv.org/abs/2605.11755v2",
                       sinkhorn_reference_code="https://github.com/hanjq17/W-Flow/blob/main/drift_loss_ot.py",
                       sinkhorn_reference_code_sha256="c987285caf69cb1085e3e50450936368373087d6066bb6fe15020bae8796b58e",
-                      sinkhorn_module_sha256=hashlib.sha256(Path(__file__).with_name('sinkhorn.py').read_bytes()).hexdigest(),
+                      sinkhorn_module_sha256=hashlib.sha256(Path(__file__).with_name('loss.py').read_bytes()).hexdigest(),
                       sinkhorn_self_transport="independent_generated_batch_no_diagonal_mask",
                       sinkhorn_reference_seed=args.seed + 5, sinkhorn_eval_reference_seed=args.seed + 6,
                       sinkhorn_cost="0.5 * squared_euclidean_in_scaled_pixel_views",
@@ -388,9 +424,11 @@ def main(default_dataset: str = "cifar10") -> None:
             raise ValueError('Resume requires the original output directory and config.json')
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         ignored = {'resume', 'threads', 'device', 'checkpoint_every'}
+        legacy_defaults = dict(optimizer='Adam', adam_beta2=0.999, weight_decay=0.0,
+                               warmup_steps=0, max_grad_norm=0.0)
         for key, value in vars(args).items():
             value = str(value) if isinstance(value, Path) else value
-            if key not in ignored and checkpoint['arguments'].get(key) != value:
+            if key not in ignored and checkpoint['arguments'].get(key, legacy_defaults.get(key)) != value:
                 raise ValueError(f'Resume configuration mismatch for {key}')
         model.load_state_dict(checkpoint['model'])
         if ema_model is not None:
@@ -432,6 +470,9 @@ def main(default_dataset: str = "cifar10") -> None:
                    else [torch.randperm(len(target), generator=rng)[:batch_size]])
         training_stats, training_updates = {}, 0
         for ids in batches:
+            learning_rate = training_learning_rate(update_count, args.learning_rate, args.warmup_steps)
+            for group in optimizer.param_groups:
+                group['lr'] = learning_rate
             batch = target[ids.to(device)]
             train_latent = torch.randn((args.particles, args.latent_dim),
                                        generator=train_latent_rng).to(device)
@@ -443,7 +484,7 @@ def main(default_dataset: str = "cifar10") -> None:
                 normalize_per_temperature=args.normalize_per_temperature,
                 multiscale_options=multiscale_options, target_options=target_options,
                 sinkhorn_latent=sinkhorn_latent, sinkhorn_epsilon=args.sinkhorn_epsilon,
-                sinkhorn_iters=args.sinkhorn_iters)
+                sinkhorn_iters=args.sinkhorn_iters, max_grad_norm=args.max_grad_norm)
             for name, value in step_diagnostics.items():
                 training_stats[name] = training_stats.get(name, 0) + float(value)
             training_updates += 1
@@ -488,8 +529,11 @@ def main(default_dataset: str = "cifar10") -> None:
                             x.unsqueeze(0), eval_train.unsqueeze(0), tau_list=args.tau_list,
                             normalize_per_temperature=args.normalize_per_temperature, epsilon=1e-6)
                     speed = info["riesz_topk_softmax_velocity_rms"].item()
+                elif args.objective == 'drifting':
+                    with torch.no_grad():
+                        _, info = drifting_loss(x.unsqueeze(0), eval_train.unsqueeze(0), tau_list=args.tau_list)
+                    speed = info['drifting_velocity_rms'].item()
                 elif args.objective == 'sinkhorn':
-                    from sinkhorn import sinkhorn_target_loss
                     ref_latent = torch.randn((args.particles, args.latent_dim),
                                              generator=torch.Generator().manual_seed(args.seed + 6)).to(device)
                     reference = evaluation_images(evaluation_model, ref_latent)
