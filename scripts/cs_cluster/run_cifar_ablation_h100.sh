@@ -16,7 +16,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
 DATA_ROOT="${DATA_ROOT:-/SAN/intelsys/imagenet_mmd_flow/data}"
 TASK_ID="${SGE_TASK_ID:?Submit with qsub (or set SGE_TASK_ID=1..8 for --dry-run)}"
-EXTRA_ARGS=()
+# Keep this nonempty for the cluster's older Bash with `set -u`.
+EXTRA_ARGS=(--field-step 1)
 case "$TASK_ID" in
     1) VARIANT=control ;;
     2) VARIANT=lr_1e4; EXTRA_ARGS=(--learning-rate 0.0001) ;;
