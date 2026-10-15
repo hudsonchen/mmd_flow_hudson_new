@@ -96,14 +96,21 @@ class CIFAR10FID:
     def score(self, stats):
         return frechet_distance(*self.reference[:2], *stats[:2])
 
-    def evaluate_generator(self, model, latent_dim, *, count=10000, seed=12345):
+    def evaluate_generator(self, model, latent_dim, *, count=10000, seed=12345,
+                           class_ids=None, cfg_scale=1.0):
         rng = torch.Generator().manual_seed(seed)
         training = model.training
         model.eval()
         def batches():
             for start in range(0, count, self.batch_size):
                 z = torch.randn(min(self.batch_size, count - start), latent_dim, generator=rng)
-                yield model(z.to(self.device))
+                if class_ids is None:
+                    yield model(z.to(self.device))
+                else:
+                    # Keep labels balanced and invariant to evaluation batch size.
+                    classes = torch.as_tensor(class_ids, device=self.device, dtype=torch.long)
+                    labels = classes[torch.arange(start, start + len(z), device=self.device) % len(classes)]
+                    yield model(z.to(self.device), labels=labels, cfg_scale=cfg_scale)
         try:
             stats = feature_statistics(batches(), self.inception, self.device)
             return self.score(stats)

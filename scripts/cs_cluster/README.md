@@ -1,5 +1,40 @@
 # CIFAR-10 on cs-cluster
 
+## CFG for Drifting, softmax Riesz, and Sinkhorn
+
+The three-task launcher adds class and guidance-scale conditioning to every
+CIFAR U-Net residual block. It trains the guidance inside the particle field,
+then generates in one forward pass at the requested scale.
+
+```bash
+qsub scripts/cs_cluster/run_cifar_cfg_h100.sh
+SGE_TASK_ID=3 bash scripts/cs_cluster/run_cifar_cfg_h100.sh --dry-run
+```
+
+Tasks 1/2/3 are Drifting/Sinkhorn/softmax Riesz. The optimizer, architecture,
+multiscale views, and 200,000-update budget match the original B adaptation
+below. Each update samples one class, 64 positives from that class, 64 fresh
+generated particles, 32 unconditional real samples from all training images,
+and a scale in [1,4] with density proportional to scale^-5. Sinkhorn also
+generates an independent same-class/same-scale reference population.
+`CFG_GROUPS` (default 1) averages independently normalized interaction groups
+sequentially before one optimizer and EMA update. This bounds memory; it does
+not reproduce the reference's joint normalization over 128 groups.
+
+Outputs use `results/cifar/cfgB_cifar_<JOB_ID>_<TASK_ID>_<OBJECTIVE>/`.
+FID-10K and sample grids are saved separately for scales 1, 1.5, 2, and 3,
+using the same latent seed and balanced class labels. The usual
+`fid_metrics.json`, plots, and trajectory use the first evaluation scale (1).
+All scales are recorded in `fid_cfg_metrics.json`.
+Scheduler logs are `/home/zongchen/cifar_cfg_b.o<JOB_ID>.<TASK_ID>`.
+These jobs still use pixel views rather than the reference MAE features.
+
+Direct CLI usage supports `--cfg`, `--cfg-min`, `--cfg-max`, `--cfg-power`,
+`--cfg-no-guidance-fraction`, `--cfg-uncond-samples`, `--cfg-groups`, and
+`--cfg-eval-scales`. Use `--steps`: sampled class groups do not constitute
+complete dataset passes. CFG sampling and every scale's FID history are saved
+and restored in the latest checkpoint.
+
 ## Drifting and Sinkhorn with released B-model hyperparameters
 
 `run_cifar_official_b_h100.sh` launches a two-task H100 array: task 1 is

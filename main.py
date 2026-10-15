@@ -18,7 +18,8 @@ from data import (FILES, CIFAR10_ARCHIVES, CIFAR10_CLASSES, download_mnist,
 from loss import (backpropagate_objective, mean_distance, mmd_squared, velocity,
                   _riesz_topk_softmax_loss_impl, drifting_loss, sinkhorn_target_loss)
 from visualization import save_grid, save_trajectory, plot_mmd
-from multiscale import multiscale_loss
+from multiscale import multiscale_loss, objective_surrogate
+from guidance import guided_generator_step
 
 
 @torch.no_grad()
@@ -31,12 +32,13 @@ def update_ema(model: torch.nn.Module, ema_model: torch.nn.Module, decay: float)
 
 
 @torch.no_grad()
-def evaluation_images(model: torch.nn.Module, latent: torch.Tensor) -> torch.Tensor:
+def evaluation_images(model: torch.nn.Module, latent: torch.Tensor, *, labels=None,
+                      cfg_scale=1.0) -> torch.Tensor:
     """Disable dropout for diagnostics without changing training mode or its RNG."""
     training = model.training
     model.eval()
     try:
-        return model(latent)
+        return model(latent) if labels is None else model(latent, labels=labels, cfg_scale=cfg_scale)
     finally:
         model.train(training)
 
@@ -65,9 +67,13 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
         with torch.no_grad():
             reference_images = model(sinkhorn_latent)
     diagnostics = {}
-    if multiscale_options is None and objective == 'sinkhorn':
-        loss, diagnostics = sinkhorn_target_loss(
-            images, target, reference_images, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
+    if multiscale_options is None and objective in ('drifting', 'sinkhorn', 'softmax-riesz') and not target_options:
+        values = {}
+        loss = objective_surrogate(
+            images, target, chunk_size, objective=objective, tau_list=tau_list,
+            normalize_per_temperature=normalize_per_temperature, reference=reference_images,
+            sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters, diagnostics=values)
+        diagnostics = {name: torch.stack(items).mean() for name, items in values.items()}
         loss.backward()
     elif multiscale_options is None and target_options:
         from target_updates import softmax_target_loss
@@ -86,8 +92,9 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
             sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
             **multiscale_options)
         loss.backward()
-    if max_grad_norm:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm or float('inf'),
+                                         error_if_nonfinite=True)
+    diagnostics['gradient_norm'] = norm.detach()
     optimizer.step()
     return diagnostics
 
@@ -150,6 +157,18 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
                         help="Spatial U-Net noise: 784 for MNIST, 3072 for CIFAR-10; MLP: 32")
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 256])
     parser.add_argument("--objective", choices=("softmax-riesz", "riesz", "sinkhorn", "drifting"), default="softmax-riesz")
+    parser.add_argument('--cfg', action='store_true', help='Train a class- and guidance-conditioned CIFAR U-Net')
+    parser.add_argument('--cfg-min', type=float, default=1.0)
+    parser.add_argument('--cfg-max', type=float, default=4.0)
+    parser.add_argument('--cfg-power', type=float, default=5.0,
+                        help='Guidance sampling density proportional to scale**(-power)')
+    parser.add_argument('--cfg-no-guidance-fraction', type=float, default=0.0,
+                        help='Probability of explicitly training scale one')
+    parser.add_argument('--cfg-uncond-samples', type=int, default=32)
+    parser.add_argument('--cfg-groups', type=int, default=1,
+                        help='Class/scale interaction groups averaged per optimizer update')
+    parser.add_argument('--cfg-eval-scales', type=float, nargs='+', default=[1.0, 1.5, 2.0, 3.0],
+                        help='First scale supplies the main FID/trajectory; also save each scale separately')
     parser.add_argument("--sinkhorn-epsilon", type=float, default=0.05,
                         help="Dimension-relative entropic regularization for quadratic Sinkhorn")
     parser.add_argument("--sinkhorn-iters", type=int, default=10)
@@ -182,6 +201,22 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    if args.cfg:
+        if args.dataset != 'cifar10' or args.architecture != 'unet' or args.objective == 'riesz':
+            parser.error('--cfg supports CIFAR U-Net with drifting, softmax-riesz, or sinkhorn')
+        if args.epochs is not None:
+            parser.error('--cfg uses sampled class groups; specify --steps, not full-pass --epochs')
+        if args.particles < 2 or args.cfg_groups < 1 or args.cfg_uncond_samples < 1:
+            parser.error('CFG needs at least two particles and positive group/unconditional counts')
+        if (not all(math.isfinite(v) for v in [args.cfg_min, args.cfg_max, args.cfg_power,
+                                              args.cfg_no_guidance_fraction, *args.cfg_eval_scales])
+                or args.cfg_min < 1 or args.cfg_max < args.cfg_min
+                or not 0 <= args.cfg_no_guidance_fraction <= 1
+                or any(v < args.cfg_min or v > args.cfg_max for v in args.cfg_eval_scales)
+                or len(set(args.cfg_eval_scales)) != len(args.cfg_eval_scales)):
+            parser.error('Invalid CFG range, evaluation scales, power, or probability')
+        if args.field_step != 1 or args.noise_levels != [0.0]:
+            parser.error('CFG currently requires unit field step and zero added view noise')
     if (not 0 <= args.adam_beta2 < 1 or args.warmup_steps < 0
             or not math.isfinite(args.weight_decay) or args.weight_decay < 0
             or not math.isfinite(args.max_grad_norm) or args.max_grad_norm < 0):
@@ -274,12 +309,25 @@ def main(default_dataset: str = "cifar10") -> None:
         train_ids = train_ids[:args.target_size]
     test_ids = test_ids[torch.randperm(len(test_ids), generator=rng)[:args.eval_size]]
     target = train[train_ids].to(device=device, dtype=torch.float32) / 255
+    target_labels = train_labels[train_ids]
+    class_ids = sorted(target_labels.unique().tolist()) if args.cfg else None
+    eval_labels = (torch.tensor(class_ids, device=device)[torch.arange(args.particles, device=device) % len(class_ids)]
+                   if args.cfg else None)
+    eval_cfg = args.cfg_eval_scales[0] if args.cfg else 1.0
+    class_pools = ({label: target[(target_labels == label).to(device)] for label in class_ids}
+                   if args.cfg else None)
+    if args.cfg:
+        if not args.target_batch_size:
+            raise ValueError('CFG requires an explicit positive --target-batch-size per class group')
+        if any(len(pool) < args.target_batch_size for pool in class_pools.values()):
+            raise ValueError('Each selected class needs at least target-batch-size training images')
     heldout = test[test_ids].to(device=device, dtype=torch.float32) / 255
     # Evaluation identities stay fixed; training uses independent fresh latents.
     eval_latent = torch.randn((args.particles, args.latent_dim),
                              generator=torch.Generator().manual_seed(args.seed + 4)).to(device)
     train_latent_rng = torch.Generator().manual_seed(args.seed + 1)
     sinkhorn_rng = torch.Generator().manual_seed(args.seed + 5)
+    cfg_rng = torch.Generator().manual_seed(args.seed + 7)
     noise_rng = torch.Generator(device=device).manual_seed(args.seed + 3)
     target_options = None
     if args.field_step != 1 or args.noise_levels != [0.0]:
@@ -293,13 +341,13 @@ def main(default_dataset: str = "cifar10") -> None:
             global_weight=args.global_loss_weight, coarse_weight=args.coarse_loss_weight,
             patch_weight=args.patch_loss_weight)
     model = build_backbone(args.dataset, args.architecture, args.latent_dim, args.base_channels,
-                           args.hidden_dims, args.num_res_blocks).to(device)
+                           args.hidden_dims, args.num_res_blocks, num_classes=10 if args.cfg else 0).to(device)
     optimizer = getattr(torch.optim, args.optimizer)(
         model.parameters(), lr=args.learning_rate, betas=(0.9, args.adam_beta2),
         weight_decay=args.weight_decay)
     ema_model = copy.deepcopy(model).requires_grad_(False).eval() if args.ema_decay else None
     evaluation_model = ema_model if ema_model is not None else model
-    x = evaluation_images(evaluation_model, eval_latent)
+    x = evaluation_images(evaluation_model, eval_latent, labels=eval_labels, cfg_scale=eval_cfg)
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / "config.json").exists() and args.resume is None:
         raise FileExistsError(f"Existing run in {args.output}; choose a fresh --output")
@@ -309,6 +357,18 @@ def main(default_dataset: str = "cifar10") -> None:
                   noise_sampling_seed=args.seed + 3,
                   noise_geometry="independent_gaussian_per_view_no_clipping",
                   target_regression_scaling="anchor_batch_scale")
+    if args.cfg:
+        config.update(conditioning='class_and_guidance_scale_FiLM_each_residual_block',
+                      cfg_sampling_seed=args.seed + 7, cfg_class_ids=class_ids,
+                      cfg_training='one_pass_guided_field_regression',
+                      cfg_unconditional_source='uniform_full_training_split_including_selected_class',
+                      cfg_primary_evaluation_scale=eval_cfg,
+                      cfg_positive_sampling='uniform_without_replacement_within_class_per_group',
+                      cfg_class_sampling='uniform_over_selected_classes_with_replacement',
+                      cfg_gradient_reduction='mean_over_groups_then_one_optimizer_and_ema_update',
+                      cfg_field_rule={'drifting': 'reference_affinity_weights_(scale-1)*(N-1)/U',
+                                      'softmax-riesz': 'scale*A_positive-A_generated-(scale-1)*A_unconditional',
+                                      'sinkhorn': 'scale*T_positive-T_generated-(scale-1)*T_unconditional'}[args.objective])
     unit = "epoch" if args.epochs is not None else "step"
     total_iterations = args.epochs if unit == "epoch" else args.steps
     batch_size = args.target_batch_size or len(target)
@@ -360,7 +420,7 @@ def main(default_dataset: str = "cifar10") -> None:
                       softmax_module_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
                       softmax_epsilon=1e-6, softmax_direction_epsilon=1e-8,
                       softmax_rms_epsilon=1e-8, softmax_feature_space="raw_pixels",
-                      softmax_fixed_negatives=False,
+                      softmax_fixed_negatives=args.cfg,
                       velocity_diagnostic="normalized_field_in_scaled_pixel_space")
     elif args.objective == 'drifting':
         config.update(kernel='joint_row_column_softmax_geometric_mean',
@@ -414,10 +474,20 @@ def main(default_dataset: str = "cifar10") -> None:
     trajectory_states, trajectory_iterations, history = [], [], []
     update_count = 0
     fid_history = []
+    fid_history_by_cfg = {str(scale): [] for scale in args.cfg_eval_scales} if args.cfg else {}
     training_stats, training_updates = {}, 0
     loss_names = ('global', 'coarse', 'patch', 'combined') if args.multiscale_loss else ()
     if args.objective == 'sinkhorn':
         loss_names += ('sinkhorn_velocity_raw_rms', 'sinkhorn_marginal_max_error')
+    normalization_names = ('scale_inputs', 'normalized_field_rms', 'normalization_floor_active', 'gradient_norm')
+    loss_names += normalization_names
+    if args.cfg:
+        loss_names += ('cfg_scale_mean',)
+    metric_header = (["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
+                      "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
+                     + (["fid"] if fid_evaluator is not None else [])
+                     + [f'train_{name}_surrogate' if name in ('global', 'coarse', 'patch', 'combined')
+                        else name for name in loss_names])
     start_iteration, elapsed_offset = 0, 0.0
     if args.resume is not None:
         if not (args.output / 'config.json').exists():
@@ -425,7 +495,9 @@ def main(default_dataset: str = "cifar10") -> None:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         ignored = {'resume', 'threads', 'device', 'checkpoint_every'}
         legacy_defaults = dict(optimizer='Adam', adam_beta2=0.999, weight_decay=0.0,
-                               warmup_steps=0, max_grad_norm=0.0)
+                               warmup_steps=0, max_grad_norm=0.0, cfg=False, cfg_min=1.0,
+                               cfg_max=4.0, cfg_power=5.0, cfg_no_guidance_fraction=0.0,
+                               cfg_uncond_samples=32, cfg_groups=1, cfg_eval_scales=[1.0, 1.5, 2.0, 3.0])
         for key, value in vars(args).items():
             value = str(value) if isinstance(value, Path) else value
             if key not in ignored and checkpoint['arguments'].get(key, legacy_defaults.get(key)) != value:
@@ -441,6 +513,9 @@ def main(default_dataset: str = "cifar10") -> None:
         train_latent_rng.set_state(checkpoint['latent_rng'])
         if 'sinkhorn_rng' in checkpoint:
             sinkhorn_rng.set_state(checkpoint['sinkhorn_rng'])
+        if args.cfg:
+            cfg_rng.set_state(checkpoint['cfg_rng'])
+            fid_history_by_cfg = checkpoint['fid_history_by_cfg']
         noise_rng.set_state(checkpoint['noise_rng'])
         if multiscale_options is not None:
             multiscale_options['patch_rng'].set_state(checkpoint['patch_rng'])
@@ -455,10 +530,13 @@ def main(default_dataset: str = "cifar10") -> None:
             rows = list(csv.reader(previous))
         with (args.output / 'metrics.csv').open('w', newline='') as previous:
             csv.writer(previous).writerows(
-                [rows[0]] + [r for r in rows[1:] if int(r[0]) < start_iteration])
+                [metric_header] + [r + [''] * (len(metric_header) - len(r))
+                                   for r in rows[1:] if int(r[0]) < start_iteration])
         if fid_evaluator is not None:
             (args.output / 'fid_metrics.json').write_text(json.dumps(
                 [{'iteration': i, 'fid': f} for i, f in fid_history], indent=2) + '\n')
+        if args.cfg:
+            (args.output / 'fid_cfg_metrics.json').write_text(json.dumps(fid_history_by_cfg, indent=2) + '\n')
         # The loop below starts with evaluation; perform the pending epoch first.
         resume_training = start_iteration <= total_iterations
     else:
@@ -466,6 +544,25 @@ def main(default_dataset: str = "cifar10") -> None:
 
     def train_iteration():
         nonlocal update_count, training_stats, training_updates
+        if args.cfg:
+            learning_rate = training_learning_rate(update_count, args.learning_rate, args.warmup_steps)
+            for group in optimizer.param_groups:
+                group['lr'] = learning_rate
+            training_stats = guided_generator_step(
+                model, optimizer, class_pools, train, rng=cfg_rng, latent_rng=train_latent_rng,
+                reference_rng=sinkhorn_rng, particles=args.particles, latent_dim=args.latent_dim,
+                positives=args.target_batch_size, unconditional_samples=args.cfg_uncond_samples,
+                groups=args.cfg_groups, cfg_min=args.cfg_min, cfg_max=args.cfg_max,
+                cfg_power=args.cfg_power, cfg_no_guidance_fraction=args.cfg_no_guidance_fraction,
+                objective=args.objective, tau_list=tuple(args.tau_list),
+                normalize_per_temperature=args.normalize_per_temperature, chunk_size=args.chunk_size,
+                multiscale_options=multiscale_options, sinkhorn_epsilon=args.sinkhorn_epsilon,
+                sinkhorn_iters=args.sinkhorn_iters, max_grad_norm=args.max_grad_norm)
+            training_updates = 1
+            if ema_model is not None:
+                update_ema(model, ema_model, args.ema_decay)
+            update_count += 1
+            return
         batches = (epoch_batches(len(target), batch_size, rng) if unit == 'epoch'
                    else [torch.randperm(len(target), generator=rng)[:batch_size]])
         training_stats, training_updates = {}, 0
@@ -500,22 +597,28 @@ def main(default_dataset: str = "cifar10") -> None:
     with (args.output / "metrics.csv").open("a" if args.resume else "w", newline="") as stream:
         writer = csv.writer(stream)
         if args.resume is None:
-            writer.writerow(["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
-                             "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
-                            + (["fid"] if fid_evaluator is not None else [])
-                            + [name if name.startswith('sinkhorn_') else f'train_{name}_surrogate'
-                               for name in loss_names])
+            writer.writerow(metric_header)
         for iteration in range(start_iteration, total_iterations + 1):
             if iteration > 0:
-                x = evaluation_images(evaluation_model, eval_latent)
+                x = evaluation_images(evaluation_model, eval_latent, labels=eval_labels, cfg_scale=eval_cfg)
                 if not torch.isfinite(x).all():
                     raise RuntimeError(f"Nonfinite generated images after update {update_count}")
             # Evaluate every full epoch, even when particle grids are saved less often.
             if unit == "epoch" or iteration in save_iterations:
                 fid_value = ""
                 if fid_evaluator is not None and iteration in save_iterations:
-                    fid_value = fid_evaluator.evaluate_generator(
-                        evaluation_model, args.latent_dim, count=args.fid_samples, seed=args.seed + 12345)
+                    if args.cfg:
+                        for scale in args.cfg_eval_scales:
+                            value = fid_evaluator.evaluate_generator(
+                                evaluation_model, args.latent_dim, count=args.fid_samples,
+                                seed=args.seed + 12345, class_ids=class_ids, cfg_scale=scale)
+                            fid_history_by_cfg[str(scale)].append(dict(iteration=iteration, fid=value))
+                            print(f'{unit}={iteration} CFG={scale:g} FID={value:.6f}', flush=True)
+                        (args.output / 'fid_cfg_metrics.json').write_text(json.dumps(fid_history_by_cfg, indent=2) + '\n')
+                        fid_value = fid_history_by_cfg[str(eval_cfg)][-1]['fid']
+                    else:
+                        fid_value = fid_evaluator.evaluate_generator(
+                            evaluation_model, args.latent_dim, count=args.fid_samples, seed=args.seed + 12345)
                     fid_history.append((iteration, fid_value))
                     (args.output / "fid_metrics.json").write_text(json.dumps(
                         [{"iteration": i, "fid": f} for i, f in fid_history], indent=2) + "\n")
@@ -536,7 +639,8 @@ def main(default_dataset: str = "cifar10") -> None:
                 elif args.objective == 'sinkhorn':
                     ref_latent = torch.randn((args.particles, args.latent_dim),
                                              generator=torch.Generator().manual_seed(args.seed + 6)).to(device)
-                    reference = evaluation_images(evaluation_model, ref_latent)
+                    reference = evaluation_images(evaluation_model, ref_latent,
+                                                  labels=eval_labels, cfg_scale=eval_cfg)
                     _, info = sinkhorn_target_loss(
                         x, eval_train, reference, epsilon=args.sinkhorn_epsilon, iterations=args.sinkhorn_iters)
                     speed = info['sinkhorn_velocity_raw_rms'].item()
@@ -554,6 +658,11 @@ def main(default_dataset: str = "cifar10") -> None:
                       f"elapsed={time.monotonic() - started:.1f}s", flush=True)
             if iteration in save_iterations:
                 save_grid(x, args.output / f"particles_{unit}_{iteration:06d}.png", image_shape=image_shape)
+                if args.cfg:
+                    for scale in args.cfg_eval_scales:
+                        samples = evaluation_images(evaluation_model, eval_latent, labels=eval_labels, cfg_scale=scale)
+                        save_grid(samples, args.output / f'particles_{unit}_{iteration:06d}_cfg_{scale:g}.png',
+                                  image_shape=image_shape)
                 trajectory_states.append(x.detach().cpu().reshape(-1, *image_shape).clone())
                 trajectory_iterations.append(iteration)
                 save_trajectory(trajectory_states, trajectory_iterations, args.output,
@@ -569,6 +678,7 @@ def main(default_dataset: str = "cifar10") -> None:
                     cuda_rng=torch.cuda.get_rng_state_all() if device == 'cuda' else [],
                     data_rng=rng.get_state(), latent_rng=train_latent_rng.get_state(),
                     sinkhorn_rng=sinkhorn_rng.get_state(),
+                    cfg_rng=cfg_rng.get_state(), fid_history_by_cfg=fid_history_by_cfg,
                     noise_rng=noise_rng.get_state(),
                     patch_rng=multiscale_options['patch_rng'].get_state() if multiscale_options else None,
                     history=history, fid_history=fid_history, trajectory_states=trajectory_states,

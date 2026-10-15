@@ -14,13 +14,21 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
 DATA_ROOT="${DATA_ROOT:-/SAN/intelsys/imagenet_mmd_flow/data}"
-case "${SGE_TASK_ID:?Expected array task 1 or 2}" in
+case "${SGE_TASK_ID:?Expected array task 1, 2, or 3}" in
     1) OBJECTIVE=drifting ;;
     2) OBJECTIVE=sinkhorn ;;
+    3) OBJECTIVE=softmax-riesz ;;
     *) exit 2 ;;
 esac
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/zongchen/mmd_flow_hudson_new/results/cifar}"
 OUTPUT="$OUTPUT_ROOT/officialB_cifar_${JOB_ID:-dryrun}_${SGE_TASK_ID}_${OBJECTIVE}"
+GUIDANCE_ARGS=(--field-step 1)
+if [[ "${CFG:-0}" == 1 ]]; then
+    OUTPUT="$OUTPUT_ROOT/cfgB_cifar_${JOB_ID:-dryrun}_${SGE_TASK_ID}_${OBJECTIVE}"
+    GUIDANCE_ARGS=(--cfg --cfg-min 1 --cfg-max 4 --cfg-power 5
+                   --cfg-uncond-samples 32 --cfg-groups "${CFG_GROUPS:-1}"
+                   --cfg-eval-scales 1 1.5 2 3)
+fi
 SOURCE="$OUTPUT/source"
 COMMAND=("$PYTHON" -u "$SOURCE/main.py"
     --dataset cifar10 --data-root "$DATA_ROOT" --target-size 0 --target-batch-size 64
@@ -33,7 +41,7 @@ COMMAND=("$PYTHON" -u "$SOURCE/main.py"
     --multiscale-loss --coarse-sizes 8 16 --patch-sizes 7 14 --crops-per-size 1
     --global-loss-weight 1 --coarse-loss-weight 1 --patch-loss-weight 1
     --fid-samples 10000 --fid-batch-size 64 --save-every 5000 --checkpoint-every 2000
-    --threads 4 --device cuda --trajectory-particles 8 --output "$OUTPUT")
+    --threads 4 --device cuda --trajectory-particles 8 "${GUIDANCE_ARGS[@]}" --output "$OUTPUT")
 if [[ "${1:-}" == --dry-run ]]; then
     printf '%q ' "${COMMAND[@]}"; printf '\n'; exit 0
 fi
@@ -73,6 +81,11 @@ assert config['total_updates'] == 200000 and config['actual_target_size'] == 500
 assert int(rows[-1]['update']) == 200000 and len(rows) == 41
 assert len(fid) == 41 and fid[-1]['iteration'] == 200000
 assert (root / 'checkpoint_latest.pt').is_file()
+if config.get('cfg'):
+    by_scale = json.loads((root / 'fid_cfg_metrics.json').read_text())
+    assert set(by_scale) == {str(scale) for scale in config['cfg_eval_scales']}
+    assert all(len(values) == 41 and values[-1]['iteration'] == 200000
+               for values in by_scale.values())
 PY
         code=$?
     fi

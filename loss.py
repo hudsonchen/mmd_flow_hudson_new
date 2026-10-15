@@ -51,7 +51,11 @@ def _softmax_toward(
         empty_ess = source.new_zeros(source.shape[:2])
         return torch.zeros_like(source), empty_ess
 
-    distance = torch.cdist(source, target)
+    # Center before the barycentric subtraction: near-identical sigmoid images
+    # otherwise subtract two large float32 numbers to recover a tiny direction.
+    origin = source.mean(dim=1, keepdim=True)
+    source, target = source - origin, target - origin
+    distance = torch.cdist(source, target, compute_mode='donot_use_mm_for_euclid_dist')
     logits = -distance / tau
     if exclude_self:
         diagonal = torch.eye(
@@ -91,6 +95,7 @@ def _riesz_topk_softmax_loss_impl(
     direction_epsilon: float = 1e-8,
     normalize_per_temperature: bool = False,
     return_field: bool = False,
+    cfg_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Regress toward the detached, RMS-normalized softmax Riesz velocity.
 
@@ -107,14 +112,20 @@ def _riesz_topk_softmax_loss_impl(
     weights multiply the normalized softmax averages, preserving the training
     code's CFG coefficients. The generated particle itself is excluded from
     its self-interaction softmax because its unit direction is undefined.
+    ``cfg_scale`` multiplies conditional attraction; guided callers supply
+    constant ``weight_neg=cfg_scale-1`` for unconditional real samples.
     """
     temperatures = (
         tuple(float(value) for value in tau_list)
         if tau_list is not None
         else (float(tau),)
     )
-    if not temperatures or any(value <= 0 for value in temperatures):
+    if not temperatures or any(not math.isfinite(value) or value <= 0 for value in temperatures):
         raise ValueError("tau_list must contain at least one positive temperature")
+    if not math.isfinite(cfg_scale) or cfg_scale < 1:
+        raise ValueError('CFG scale must be finite and at least one')
+    if cfg_scale != 1 and (fixed_neg is None or fixed_neg.shape[1] == 0):
+        raise ValueError('Guided softmax Riesz needs unconditional real samples')
     if epsilon <= 0 or rms_epsilon <= 0 or direction_epsilon <= 0:
         raise ValueError("epsilon, rms_epsilon, and direction_epsilon must be positive")
     if gen.ndim != 3 or fixed_pos.ndim != 3:
@@ -157,8 +168,14 @@ def _riesz_topk_softmax_loss_impl(
     with torch.no_grad():
         old_gen = gen.detach()
         scale_targets = torch.cat([old_gen, fixed_neg, fixed_pos], dim=1)
-        scale_weights = torch.cat([weight_gen, weight_neg, weight_pos], dim=1)
-        scale_distance = torch.cdist(old_gen, scale_targets)
+        # Geometry pools pair distances rather than population averages. Keep
+        # unconditional *total mass* independent of its Monte Carlo count,
+        # while the field below uses the population-average CFG coefficient.
+        scale_weight_neg = (weight_neg * (gen.shape[1] - 1) / fixed_neg.shape[1]
+                            if cfg_scale != 1 else weight_neg)
+        scale_weights = torch.cat([weight_gen, scale_weight_neg, weight_pos], dim=1)
+        scale_distance = torch.cdist(old_gen, scale_targets,
+                                    compute_mode='donot_use_mm_for_euclid_dist')
         scale = (
             (scale_distance * scale_weights[:, None, :]).mean()
             / (scale_weights.mean() + float(epsilon))
@@ -205,7 +222,7 @@ def _riesz_topk_softmax_loss_impl(
                 softmax_temperature,
                 direction_epsilon,
             )
-            temperature_attraction = toward_pos / float(temperature)
+            temperature_attraction = cfg_scale * toward_pos / float(temperature)
             temperature_self_repulsion = -toward_gen / float(temperature)
             temperature_fixed_negative = -toward_neg / float(temperature)
             temperature_field = (
@@ -242,6 +259,10 @@ def _riesz_topk_softmax_loss_impl(
 
     info: Dict[str, torch.Tensor] = {
         "scale": scale.detach(),
+        "scale_inputs": scale_inputs.detach(),
+        "normalized_field_rms": _rms(frozen_velocity).detach(),
+        "normalization_floor_active": (torch.stack(per_temperature_rms).square() < 1e-8).float().mean()
+        if normalize_per_temperature else (force_rms < rms_epsilon).float(),
         "riesz_topk_softmax_force_rms": force_rms.detach(),
         "riesz_topk_softmax_tau_count": torch.tensor(
             float(len(temperatures)), device=gen.device
@@ -357,7 +378,7 @@ def sinkhorn_plan(source, support, *, epsilon, iterations=10):
         raise ValueError('Sinkhorn needs nonempty [particles, dimension] populations')
     if not math.isfinite(epsilon) or epsilon <= 0 or iterations < 1:
         raise ValueError('Sinkhorn epsilon and iteration count must be positive')
-    cost = 0.5 * torch.cdist(source, support).square()
+    cost = 0.5 * torch.cdist(source, support, compute_mode='donot_use_mm_for_euclid_dist').square()
     log_kernel = -cost / epsilon
     log_a, log_b = -math.log(len(source)), -math.log(len(support))
     log_v = support.new_zeros(len(support))
@@ -379,7 +400,8 @@ def sinkhorn_barycenter(source, support, *, epsilon, iterations=10):
     return projected, torch.maximum(row_error, col_error)
 
 
-def sinkhorn_target_loss(features, target, reference, *, epsilon=0.05, iterations=10):
+def sinkhorn_target_loss(features, target, reference, *, epsilon=0.05, iterations=10,
+                         unconditional=None, cfg_scale=1.0, return_field=False):
     """Regress toward x + T_real(x) - T_independent_generated(x).
 
     `reference` must be a separately sampled, detached generator population.
@@ -388,11 +410,16 @@ def sinkhorn_target_loss(features, target, reference, *, epsilon=0.05, iteration
     """
     if reference is None:
         raise ValueError('W-Flow requires an independent generated reference batch')
+    if not math.isfinite(cfg_scale) or cfg_scale < 1:
+        raise ValueError('CFG scale must be finite and at least one')
+    if cfg_scale != 1 and (unconditional is None or not len(unconditional)):
+        raise ValueError('Guided Sinkhorn needs unconditional real samples')
     with torch.no_grad():
         x, y, ref = features.detach().float(), target.detach().float(), reference.detach().float()
         dimension = x.shape[1]
         support = torch.cat((x, ref, y))
-        distance_rms = (torch.cdist(x, support).square().mean() / (1 + 1e-8)).sqrt()
+        distance_rms = (torch.cdist(x, support, compute_mode='donot_use_mm_for_euclid_dist')
+                        .square().mean() / (1 + 1e-8)).sqrt()
         scale = (distance_rms / math.sqrt(dimension)).clamp_min(1e-3)
         xs, ys, rs = x / scale, y / scale, ref / scale
         regularization = epsilon * dimension
@@ -401,12 +428,22 @@ def sinkhorn_target_loss(features, target, reference, *, epsilon=0.05, iteration
         repulsion, generated_error = sinkhorn_barycenter(
             xs, rs, epsilon=regularization, iterations=iterations)
         velocity = attraction - repulsion
+        if cfg_scale != 1:
+            uncond_map, uncond_error = sinkhorn_barycenter(
+                xs, unconditional.detach().float() / scale,
+                epsilon=regularization, iterations=iterations)
+            velocity = velocity + (cfg_scale - 1) * (attraction - uncond_map)
+            real_error = torch.maximum(real_error, uncond_error)
         velocity_rms = velocity.square().mean().clamp_min(1e-8).sqrt()
         goal = xs + velocity / velocity_rms
         if not torch.isfinite(goal).all():
             raise RuntimeError('Nonfinite Sinkhorn regression target')
         info = dict(sinkhorn_velocity_raw_rms=velocity.square().mean().sqrt(),
-                    sinkhorn_marginal_max_error=torch.maximum(real_error, generated_error))
+                    sinkhorn_marginal_max_error=torch.maximum(real_error, generated_error),
+                    scale_inputs=scale, normalized_field_rms=(velocity / velocity_rms).square().mean().sqrt(),
+                    normalization_floor_active=(velocity.square().mean() < 1e-8).float())
+        if return_field:
+            info['frozen_velocity'] = velocity / velocity_rms
     return (features.float() / scale - goal).square().mean(), info
 
 
@@ -452,13 +489,13 @@ def drifting_loss(gen, fixed_pos, fixed_neg=None, weight_gen=None,
         support = torch.cat([anchor, fixed_neg.detach().float(), fixed_pos.detach().float()], dim=1)
         support_weights = torch.cat(weights, dim=1)
         # Match the release's sqrt(max(squared_distance, 1e-8)), including collisions.
-        squared = (anchor.square().sum(-1, keepdim=True)
-                   + support.square().sum(-1).unsqueeze(1)
-                   - 2 * torch.bmm(anchor, support.transpose(1, 2)))
-        distances = squared.clamp_min(1e-8).sqrt()
+        # Direct differences preserve the reference's squared-distance floor
+        # without cancellation at the nearly constant pixel initialization.
+        distances = torch.cdist(anchor, support, compute_mode='donot_use_mm_for_euclid_dist').clamp_min(1e-4)
         scale = (distances * support_weights[:, None]).mean() / support_weights.mean()
         scale_inputs = (scale / math.sqrt(gen.shape[-1])).clamp_min(1e-3)
-        xs, supports = anchor / scale_inputs, support / scale_inputs
+        origin = anchor.mean(dim=1, keepdim=True)
+        xs, supports = (anchor - origin) / scale_inputs, (support - origin) / scale_inputs
         distance = distances / scale.clamp_min(1e-3)
         count = gen.shape[1]
         mask = torch.zeros_like(distance)
@@ -466,7 +503,8 @@ def drifting_loss(gen, fixed_pos, fixed_neg=None, weight_gen=None,
         distance = distance + 100 * mask
         split = count + fixed_neg.shape[1]
         field = torch.zeros_like(xs)
-        info = {'scale': scale}
+        info = {'scale': scale, 'scale_inputs': scale_inputs}
+        floor_rates = []
         for temperature in temperatures:
             logits = -distance / temperature
             affinity = (logits.softmax(-1) * logits.softmax(-2)).clamp_min(1e-6).sqrt()
@@ -477,10 +515,13 @@ def drifting_loss(gen, fixed_pos, fixed_neg=None, weight_gen=None,
             force = (torch.bmm(coefficients, supports)
                      - coefficients.sum(-1, keepdim=True) * xs)
             magnitude = force.square().mean()
+            floor_rates.append((magnitude < 1e-8).float())
             info[f'drifting_force_squared_tau_{temperature:g}'] = magnitude
             field = field + force / magnitude.clamp_min(1e-8).sqrt()
-        goal = xs + field
+        goal = anchor / scale_inputs + field
         info['drifting_velocity_rms'] = field.square().mean().sqrt()
+        info['normalized_field_rms'] = info['drifting_velocity_rms']
+        info['normalization_floor_active'] = torch.stack(floor_rates).mean()
         if return_field:
             info.update(frozen_velocity=field, scale_inputs=scale_inputs)
     return (gen / scale_inputs - goal).square().mean(dim=(-1, -2)), info

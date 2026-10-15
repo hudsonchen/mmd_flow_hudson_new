@@ -76,6 +76,12 @@ uses all eligible training images; positive sizes select a fixed subset.
 `--class-id` restricts either dataset to one class. MNIST also accepts `--digit`.
 Without either duration option, the CLI defaults to 2,000 updates.
 
+For class-conditional CIFAR generation with guidance trained into one forward
+pass, add `--cfg --cfg-eval-scales 1 1.5 2 3` and use `--steps` with an explicit
+`--target-batch-size`. This supports Drifting, softmax Riesz, and Sinkhorn.
+See the [normalization audit and CFG formulas](configs/official_reference/README.md#normalization-audit-and-cfg-extension)
+and [three-task H100 launcher](scripts/cs_cluster/README.md#cfg-for-drifting-softmax-riesz-and-sinkhorn).
+
 ## Backbones
 
 For CIFAR-10 H100 submission with `-P aihub_ucl` and result copying back from
