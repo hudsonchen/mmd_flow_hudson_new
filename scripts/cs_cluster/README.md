@@ -74,7 +74,7 @@ The array has not been submitted by Codex.
 
 | Task | Variant | Only experimental change from control |
 | --- | --- | --- |
-| 1 | `control` | None |
+| 1 | `sinkhorn` | W-Flow two-batch Sinkhorn objective, epsilon 0.05, 10 iterations |
 | 2 | `lr_1e4` | Adam learning rate 0.0001 |
 | 3 | `lr_5e5` | Adam learning rate 0.00005 |
 | 4 | `particles128` | 128 interacting generated samples per update |
@@ -83,29 +83,55 @@ The array has not been submitted by Codex.
 | 7 | `noise` | Average losses at Gaussian noise std 0, 0.05, 0.15 |
 | 8 | `explicit_h01` | Explicit detached-target field step 0.1 |
 
-All tasks use the same DDPM++ one-pass generator, softmax Riesz temperatures
-`[0.2, 0.05, 0.02]`, per-temperature RMS normalization, EMA 0.999, real batch
+The completed multiscale run's epoch-500 result is the control; it is not
+submitted again. All tasks use the same DDPM++ one-pass generator, EMA 0.999, real batch
 256, seed 0, and 500 full passes through 50,000 real training examples
 (98,000 optimizer updates). The control learning rate is 0.0002 and generated
-population is 64. No feature encoder or conditioning is added.
+population is 64. Tasks 2-8 retain softmax Riesz temperatures `[0.2, 0.05, 0.02]`
+and per-temperature RMS normalization. No feature encoder or conditioning is added.
 
 All tasks save FID-10K, sample grids, and a resumable `checkpoint_latest.pt` every
 20 epochs, including the final epoch. FID always evaluates clean EMA samples
 against the full CIFAR-10 training set, using the same latent seed. Evaluation
 latents have their own RNG so changing diagnostic population size does not
-change the training data permutation. Use this fresh control for comparisons;
-older jobs shared the diagnostic-latent RNG with data shuffling.
+change the training data permutation. No compatibility draws are made to
+reproduce the older control's RNG progression.
 
 Noise is added independently to real and generated pixels *after constructing
 each view*, without clipping, using a separate RNG. These are noise-averaged
 distribution losses, not a noise-conditioned network.
 
-All tasks retain the existing Drifting-style fixed-point regression: construct
+Tasks 2-8 retain the existing Drifting-style fixed-point regression: construct
 the stop-gradient target as current scaled output plus the sum of the three
 per-temperature normalized fields, then regress the generator toward it.
 There is no implicit numerical solver. Task 8 scales that field by 0.1; this
 rescales the gradient, which Adam largely compensates, so it need not behave
 like lowering Adam's learning rate.
+
+Task 1 replaces the field with the W-Flow update from
+[Algorithms 1 and 2 of arXiv:2605.11755v2](https://arxiv.org/html/2605.11755v2#S3):
+generated-to-real barycentric transport minus generated-to-independent-generated
+barycentric transport, followed by detached-target regression. An independent
+64-particle latent population is drawn each update using its own saved RNG;
+its generator forward has no autograd graph. All three populations use aligned
+pixel views and shared crop coordinates. The self-transport has no diagonal mask.
+
+The solver uses uniform balanced marginals, quadratic cost, log-domain updates,
+and 10 iterations. Following the
+[official implementation](https://github.com/hanjq17/W-Flow/blob/main/drift_loss_ot.py),
+each view uses an RMS batch-distance scale, regularization `0.05 * view_dimension`
+in scaled coordinates, and RMS-normalized velocity. The reference source
+SHA-256 is `c987285caf69cb1085e3e50450936368373087d6066bb6fe15020bae8796b58e`;
+the adapted normalization is MIT licensed (see `WFLOW_LICENSE.txt`).
+The CSV reports raw velocity RMS and the largest absolute transport-marginal
+error across views, averaged over each epoch. Ten iterations give an approximate
+balanced plan; the barycenters use actual row masses as in the release.
+
+This is an encoder-free CIFAR adaptation of the Sinkhorn objective, not a
+reproduction of the paper's ImageNet feature-space recipe. Architecture,
+optimizer settings, pixel-view groups, and their weights remain those of the
+completed CIFAR control. The second generator forward adds compute, but only
+one Adam update is taken per real minibatch.
 
 Outputs live under `results/cifar/ablation500_<JOB_ID>_<TASK_ID>_<VARIANT>/`.
 Each task runs its own source copy in `source/`, records source hashes, and
@@ -127,9 +153,8 @@ To resume an interrupted task, use its recorded command with the saved
 and EMA weights, Adam state, RNGs, and plotting/metric history. Only the latest
 checkpoint is retained. Resume rejects changed experimental settings.
 
-Local CPU checks:
+Shell syntax check:
 
 ```bash
-DRIFT_COMPILE=0 python -m unittest discover -s tests -v
 bash -n scripts/cs_cluster/run_cifar_ablation_h100.sh
 ```

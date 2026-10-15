@@ -19,7 +19,7 @@ TASK_ID="${SGE_TASK_ID:?Submit with qsub (or set SGE_TASK_ID=1..8 for --dry-run)
 # Keep this nonempty for the cluster's older Bash with `set -u`.
 EXTRA_ARGS=(--field-step 1)
 case "$TASK_ID" in
-    1) VARIANT=control ;;
+    1) VARIANT=sinkhorn; EXTRA_ARGS=(--objective sinkhorn) ;;
     2) VARIANT=lr_1e4; EXTRA_ARGS=(--learning-rate 0.0001) ;;
     3) VARIANT=lr_5e5; EXTRA_ARGS=(--learning-rate 0.00005) ;;
     4) VARIANT=particles128; EXTRA_ARGS=(--particles 128) ;;
@@ -49,14 +49,15 @@ if [[ "${1:-}" == --dry-run ]]; then
     exit 0
 fi
 [[ $# == 0 ]] || { echo 'Only --dry-run is supported' >&2; exit 2; }
-[[ -f "$PROJECT_ROOT/main.py" && -f "$PROJECT_ROOT/target_updates.py" ]] || {
-    echo 'Submit from the project root containing main.py and target_updates.py' >&2; exit 2;
+[[ -f "$PROJECT_ROOT/main.py" && -f "$PROJECT_ROOT/target_updates.py" && -f "$PROJECT_ROOT/sinkhorn.py" ]] || {
+    echo 'Submit from the project root containing main.py, target_updates.py and sinkhorn.py' >&2; exit 2;
 }
 [[ ! -e "$OUTPUT" ]] || { echo "Output already exists: $OUTPUT" >&2; exit 2; }
 [[ -x "$PYTHON" && -d "$PROJECT_ROOT/assets" ]] || { echo 'Missing Python environment or assets' >&2; exit 2; }
 mkdir -p "$SOURCE"
 # Run an immutable per-task source copy; assets remain shared and read-only.
 cp "$PROJECT_ROOT/"*.py "$SOURCE/"
+cp "$PROJECT_ROOT/WFLOW_LICENSE.txt" "$SOURCE/"
 ln -s "$PROJECT_ROOT/assets" "$SOURCE/assets"
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 PYTHONUNBUFFERED=1
 export EXPERIMENT_OUTPUT="$OUTPUT" EXPERIMENT_VARIANT="$VARIANT"

@@ -6,8 +6,18 @@ from loss import _riesz_topk_softmax_loss_impl, velocity
 
 
 def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
-                        normalize_per_temperature, target_options=None):
+                        normalize_per_temperature, target_options=None,
+                        reference=None, sinkhorn_epsilon=0.05, sinkhorn_iters=10,
+                        diagnostics=None):
     target = target.detach()
+    if objective == 'sinkhorn':
+        from sinkhorn import sinkhorn_target_loss
+        value, info = sinkhorn_target_loss(
+            features, target, reference, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
+        if diagnostics is not None:
+            for name, result in info.items():
+                diagnostics.setdefault(name, []).append(result)
+        return value
     if objective == 'softmax-riesz':
         if target_options:
             from target_updates import softmax_target_loss
@@ -34,7 +44,8 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                     normalize_per_temperature=True, coarse_sizes=(8, 16),
                     patch_sizes=(7, 14), crops_per_size=1, patch_rng=None,
                     global_weight=1.0, coarse_weight=1.0, patch_weight=1.0,
-                    target_options=None):
+                    target_options=None, reference_images=None,
+                    sinkhorn_epsilon=0.05, sinkhorn_iters=10):
     """Return a weighted loss and detached group diagnostics.
 
     Crop coordinates are shared across generated/real populations, without
@@ -53,20 +64,27 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
         raise ValueError('Invalid crop count or view size for this image shape')
     generated = images.reshape(-1, channels, height, width)
     real = target.detach().reshape(-1, channels, height, width)
+    reference = (reference_images.detach().reshape(-1, channels, height, width)
+                 if reference_images is not None else None)
+    diagnostics = {}
 
-    def loss(x, y):
+    def loss(x, y, ref=None):
         return objective_surrogate(x.flatten(1), y.flatten(1), chunk_size,
                                    objective=objective, tau_list=tau_list,
                                    normalize_per_temperature=normalize_per_temperature,
-                                   target_options=target_options)
+                                   target_options=target_options,
+                                   reference=ref.flatten(1) if ref is not None else None,
+                                   sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
+                                   diagnostics=diagnostics)
 
     groups = {}
     if global_weight:
-        groups['global'] = loss(generated, real)
+        groups['global'] = loss(generated, real, reference)
     if coarse_weight:
         groups['coarse'] = torch.stack([
             loss(F.adaptive_avg_pool2d(generated, (size, size)),
-                 F.adaptive_avg_pool2d(real, (size, size)))
+                 F.adaptive_avg_pool2d(real, (size, size)),
+                 F.adaptive_avg_pool2d(reference, (size, size)) if reference is not None else None)
             for size in coarse_sizes]).mean()
     if patch_weight:
         patches = []
@@ -75,9 +93,13 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                 top = int(torch.randint(height - size + 1, (), generator=patch_rng))
                 left = int(torch.randint(width - size + 1, (), generator=patch_rng))
                 patches.append(loss(generated[:, :, top:top + size, left:left + size],
-                                    real[:, :, top:top + size, left:left + size]))
+                                    real[:, :, top:top + size, left:left + size],
+                                    reference[:, :, top:top + size, left:left + size]
+                                    if reference is not None else None))
         groups['patch'] = torch.stack(patches).mean()
     total = sum(groups[name] * weight for name, weight in
                 zip(('global', 'coarse', 'patch'), weights) if weight) / sum(weights)
     return total, {**{name: value.detach() for name, value in groups.items()},
-                   'combined': total.detach()}
+                   'combined': total.detach(),
+                   **{name: torch.stack(values).max() if name == 'sinkhorn_marginal_max_error'
+                      else torch.stack(values).mean() for name, values in diagnostics.items()}}

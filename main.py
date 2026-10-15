@@ -45,7 +45,9 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
                    objective: str = "riesz", tau_list: tuple[float, ...] = (0.2, 0.05, 0.02),
                    normalize_per_temperature: bool = True,
                    multiscale_options: dict | None = None,
-                   target_options: dict | None = None) -> dict:
+                   target_options: dict | None = None,
+                   sinkhorn_latent: torch.Tensor | None = None,
+                   sinkhorn_epsilon: float = 0.05, sinkhorn_iters: int = 10) -> dict:
     """Backpropagate the chosen particle-field rule through the generator.
 
     Ordinary Riesz uses the exact half-MMD image gradient -velocity/N.
@@ -54,8 +56,19 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
     """
     optimizer.zero_grad(set_to_none=True)
     images = model(latent)
+    reference_images = None
+    if objective == 'sinkhorn':
+        if sinkhorn_latent is None:
+            raise ValueError('Sinkhorn training needs a second independently sampled latent batch')
+        with torch.no_grad():
+            reference_images = model(sinkhorn_latent)
     diagnostics = {}
-    if multiscale_options is None and target_options:
+    if multiscale_options is None and objective == 'sinkhorn':
+        from sinkhorn import sinkhorn_target_loss
+        loss, diagnostics = sinkhorn_target_loss(
+            images, target, reference_images, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
+        loss.backward()
+    elif multiscale_options is None and target_options:
         from target_updates import softmax_target_loss
         loss, diagnostics = softmax_target_loss(
             images, target, tau_list=tau_list,
@@ -68,7 +81,9 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
         loss, diagnostics = multiscale_loss(
             images, target, chunk_size=chunk_size, objective=objective,
             tau_list=tau_list, normalize_per_temperature=normalize_per_temperature,
-            target_options=target_options, **multiscale_options)
+            target_options=target_options, reference_images=reference_images,
+            sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
+            **multiscale_options)
         loss.backward()
     optimizer.step()
     return diagnostics
@@ -117,7 +132,10 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=None,
                         help="Spatial U-Net noise: 784 for MNIST, 3072 for CIFAR-10; MLP: 32")
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 256])
-    parser.add_argument("--objective", choices=("softmax-riesz", "riesz"), default="softmax-riesz")
+    parser.add_argument("--objective", choices=("softmax-riesz", "riesz", "sinkhorn"), default="softmax-riesz")
+    parser.add_argument("--sinkhorn-epsilon", type=float, default=0.05,
+                        help="Dimension-relative entropic regularization for quadratic Sinkhorn")
+    parser.add_argument("--sinkhorn-iters", type=int, default=10)
     parser.add_argument("--tau-list", type=float, nargs="+", default=[0.2, 0.05, 0.02])
     parser.add_argument("--normalize-per-temperature", action=argparse.BooleanOptionalAction,
                         default=True, help="Normalize each softmax field before summing")
@@ -147,6 +165,8 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    if not math.isfinite(args.sinkhorn_epsilon) or args.sinkhorn_epsilon <= 0 or args.sinkhorn_iters < 1:
+        parser.error('Sinkhorn epsilon and iterations must be positive')
     if (not math.isfinite(args.field_step) or args.field_step <= 0 or
             args.checkpoint_every < 0 or
             any(not math.isfinite(s) or s < 0 for s in args.noise_levels)):
@@ -236,6 +256,7 @@ def main(default_dataset: str = "cifar10") -> None:
     eval_latent = torch.randn((args.particles, args.latent_dim),
                              generator=torch.Generator().manual_seed(args.seed + 4)).to(device)
     train_latent_rng = torch.Generator().manual_seed(args.seed + 1)
+    sinkhorn_rng = torch.Generator().manual_seed(args.seed + 5)
     noise_rng = torch.Generator(device=device).manual_seed(args.seed + 3)
     target_options = None
     if args.field_step != 1 or args.noise_levels != [0.0]:
@@ -280,11 +301,11 @@ def main(default_dataset: str = "cifar10") -> None:
                                                  args.base_channels, args.hidden_dims, args.num_res_blocks),
                   hidden_activation="SiLU", output_activation="Sigmoid",
                   parameter_count=sum(p.numel() for p in model.parameters()),
-                  training_rule="detached_scaled_velocity_regression" if args.objective == "softmax-riesz"
+                  training_rule="detached_scaled_velocity_regression" if args.objective in ("softmax-riesz", "sinkhorn")
                   else "exact_half_mmd_gradient",
                   evaluation_metric="fid" if args.dataset == "cifar10" else "biased_empirical_riesz_mmd_squared",
-                  energy="softmax_field_surrogate" if args.objective == "softmax-riesz"
-                  else "0.5 * biased_empirical_mmd_squared", optimizer="Adam",
+                  energy={"softmax-riesz": "softmax_field_surrogate", "sinkhorn": "sinkhorn_velocity_regression_surrogate",
+                          "riesz": "0.5 * biased_empirical_mmd_squared"}[args.objective], optimizer="Adam",
                   adam_betas=[0.9, 0.999], adam_eps=1e-8, weight_decay=0,
                   dataset_md5=FILES if args.dataset == "mnist" else {raw.name: CIFAR10_ARCHIVES[raw.name]},
                   data_source=str(raw.resolve()),
@@ -303,7 +324,7 @@ def main(default_dataset: str = "cifar10") -> None:
                       patch_sampling_seed=args.seed + 2,
                       patch_alignment="shared_coordinates_across_generated_and_real_populations",
                       view_weighting="mean_within_group_then_normalized_group_weights",
-                      view_distance_scaling="upstream_batch_distance_scale" if args.objective == 'softmax-riesz'
+                      view_distance_scaling="upstream_batch_distance_scale" if args.objective in ('softmax-riesz', 'sinkhorn')
                       else "euclidean_distance_divided_by_sqrt_view_dimension",
                       training_loss_diagnostic="mean_over_updates_in_iteration_gradient_surrogates_not_mmd_energy")
     if args.objective == "softmax-riesz":
@@ -315,6 +336,21 @@ def main(default_dataset: str = "cifar10") -> None:
                       softmax_rms_epsilon=1e-8, softmax_feature_space="raw_pixels",
                       softmax_fixed_negatives=False,
                       velocity_diagnostic="normalized_field_in_scaled_pixel_space")
+    elif args.objective == 'sinkhorn':
+        config.update(kernel="entropic_quadratic_transport", power=2,
+                      sinkhorn_paper="https://arxiv.org/abs/2605.11755v2",
+                      sinkhorn_reference_code="https://github.com/hanjq17/W-Flow/blob/main/drift_loss_ot.py",
+                      sinkhorn_reference_code_sha256="c987285caf69cb1085e3e50450936368373087d6066bb6fe15020bae8796b58e",
+                      sinkhorn_module_sha256=hashlib.sha256(Path(__file__).with_name('sinkhorn.py').read_bytes()).hexdigest(),
+                      sinkhorn_self_transport="independent_generated_batch_no_diagonal_mask",
+                      sinkhorn_reference_seed=args.seed + 5, sinkhorn_eval_reference_seed=args.seed + 6,
+                      sinkhorn_cost="0.5 * squared_euclidean_in_scaled_pixel_views",
+                      sinkhorn_regularization="epsilon_times_view_dimension",
+                      sinkhorn_scale="rms_pair_distance_over_sqrt_view_dimension_floor_1e-3",
+                      sinkhorn_velocity_normalization="per_view_rms_floor_squared_1e-8",
+                      sinkhorn_source_space="raw_pixel_views_no_encoder",
+                      sinkhorn_marginal_diagnostic="max_absolute_plan_mass_error_per_view_then_mean_over_updates",
+                      velocity_diagnostic="sinkhorn_raw_velocity_rms_in_scaled_pixel_space")
     else:
         config["velocity_diagnostic"] = "ordinary_riesz_field_in_pixel_space"
     fid_evaluator = None
@@ -344,6 +380,8 @@ def main(default_dataset: str = "cifar10") -> None:
     fid_history = []
     training_stats, training_updates = {}, 0
     loss_names = ('global', 'coarse', 'patch', 'combined') if args.multiscale_loss else ()
+    if args.objective == 'sinkhorn':
+        loss_names += ('sinkhorn_velocity_raw_rms', 'sinkhorn_marginal_max_error')
     start_iteration, elapsed_offset = 0, 0.0
     if args.resume is not None:
         if not (args.output / 'config.json').exists():
@@ -363,6 +401,8 @@ def main(default_dataset: str = "cifar10") -> None:
             torch.cuda.set_rng_state_all(checkpoint['cuda_rng'])
         rng.set_state(checkpoint['data_rng'])
         train_latent_rng.set_state(checkpoint['latent_rng'])
+        if 'sinkhorn_rng' in checkpoint:
+            sinkhorn_rng.set_state(checkpoint['sinkhorn_rng'])
         noise_rng.set_state(checkpoint['noise_rng'])
         if multiscale_options is not None:
             multiscale_options['patch_rng'].set_state(checkpoint['patch_rng'])
@@ -395,11 +435,15 @@ def main(default_dataset: str = "cifar10") -> None:
             batch = target[ids.to(device)]
             train_latent = torch.randn((args.particles, args.latent_dim),
                                        generator=train_latent_rng).to(device)
+            sinkhorn_latent = (torch.randn((args.particles, args.latent_dim), generator=sinkhorn_rng).to(device)
+                               if args.objective == 'sinkhorn' else None)
             step_diagnostics = generator_step(
                 model, train_latent, batch, optimizer, args.chunk_size,
                 objective=args.objective, tau_list=tuple(args.tau_list),
                 normalize_per_temperature=args.normalize_per_temperature,
-                multiscale_options=multiscale_options, target_options=target_options)
+                multiscale_options=multiscale_options, target_options=target_options,
+                sinkhorn_latent=sinkhorn_latent, sinkhorn_epsilon=args.sinkhorn_epsilon,
+                sinkhorn_iters=args.sinkhorn_iters)
             for name, value in step_diagnostics.items():
                 training_stats[name] = training_stats.get(name, 0) + float(value)
             training_updates += 1
@@ -418,7 +462,8 @@ def main(default_dataset: str = "cifar10") -> None:
             writer.writerow(["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
                              "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
                             + (["fid"] if fid_evaluator is not None else [])
-                            + [f'train_{name}_surrogate' for name in loss_names])
+                            + [name if name.startswith('sinkhorn_') else f'train_{name}_surrogate'
+                               for name in loss_names])
         for iteration in range(start_iteration, total_iterations + 1):
             if iteration > 0:
                 x = evaluation_images(evaluation_model, eval_latent)
@@ -443,6 +488,14 @@ def main(default_dataset: str = "cifar10") -> None:
                             x.unsqueeze(0), eval_train.unsqueeze(0), tau_list=args.tau_list,
                             normalize_per_temperature=args.normalize_per_temperature, epsilon=1e-6)
                     speed = info["riesz_topk_softmax_velocity_rms"].item()
+                elif args.objective == 'sinkhorn':
+                    from sinkhorn import sinkhorn_target_loss
+                    ref_latent = torch.randn((args.particles, args.latent_dim),
+                                             generator=torch.Generator().manual_seed(args.seed + 6)).to(device)
+                    reference = evaluation_images(evaluation_model, ref_latent)
+                    _, info = sinkhorn_target_loss(
+                        x, eval_train, reference, epsilon=args.sinkhorn_epsilon, iterations=args.sinkhorn_iters)
+                    speed = info['sinkhorn_velocity_raw_rms'].item()
                 else:
                     speed = velocity(x, eval_train, args.chunk_size).square().mean().sqrt().item()
                 writer.writerow([iteration, iteration if unit == "epoch" else "", update_count,
@@ -471,6 +524,7 @@ def main(default_dataset: str = "cifar10") -> None:
                     optimizer=optimizer.state_dict(), torch_rng=torch.get_rng_state(),
                     cuda_rng=torch.cuda.get_rng_state_all() if device == 'cuda' else [],
                     data_rng=rng.get_state(), latent_rng=train_latent_rng.get_state(),
+                    sinkhorn_rng=sinkhorn_rng.get_state(),
                     noise_rng=noise_rng.get_state(),
                     patch_rng=multiscale_options['patch_rng'].get_state() if multiscale_options else None,
                     history=history, fid_history=fid_history, trajectory_states=trajectory_states,
