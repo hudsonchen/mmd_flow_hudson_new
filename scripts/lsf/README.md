@@ -193,3 +193,24 @@ preserved. The active primed restart is now
 `results/cifar/priming_lr2e4_seed42_20261025/`: fresh post-training from the same
 completed reconstruction, 1,000-step warmup to `2e-4`, cosine decay to `1e-4`,
 and unchanged EMA decay `0.9999`. The comparison notebook selects this run.
+
+
+## Two Riesz experiments per H200
+
+`run_cifar_pair.py --manifest PAIR/manifest.json` runs two independent training
+processes on the same LSF-allocated GPU, with two CPU threads per process.
+Request four CPU slots and `num=1:mode=shared:j_exclusive=yes:gmem=80G`:
+shared compute mode permits both CUDA contexts, while job exclusivity keeps the
+GPU reserved to the pair. The existing per-run full-width smoke checks execute
+sequentially before both trainers start. Model, optimizer, RNG, and output files
+remain independent. Existing checkpoints automatically resume; each completed
+run is archived and refreshes the notebook. A failed trainer is recorded while
+its companion continues. `--dry-run` prints the two effective commands.
+
+The deployment under `results/cifar/shared_h200_20261026/` pairs normalized and
+unnormalized softmax at LR 2e-4, and softmax LR 5e-4 with standard Riesz LR 2e-4.
+The original run source snapshots are retained. Only CPU threads change from
+four to two. Diffusion was stopped by user request with a durable update-192,000
+checkpoint preserved in its `training/checkpoints/paused_20261026T000911Z/`
+directory; its dependent finalizer was cancelled. GPU sharing changes throughput,
+so wall-clock comparisons should account for this scheduling change.
