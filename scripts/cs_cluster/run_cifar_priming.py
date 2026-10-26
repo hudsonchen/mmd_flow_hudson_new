@@ -60,7 +60,7 @@ def main():
     import fcntl
     lock = (study / 'worker.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
     hashes = {str(p.relative_to(repo)): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in [*repo.glob('*.py'), *Path(__file__).parent.glob('*priming*'),
                         Path(__file__).parent / 'smoke_cifar_4gpu.py']
