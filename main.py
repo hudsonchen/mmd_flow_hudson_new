@@ -251,6 +251,8 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument('--data-parallel-gpus', type=int, default=1,
+                        help='Split generator forwards across this many local GPUs; retain the global particle loss')
     args = parser.parse_args()
     if args.resume and args.fork_checkpoint:
         parser.error('--resume and --fork-checkpoint are mutually exclusive')
@@ -359,6 +361,11 @@ def main(default_dataset: str = "cifar10") -> None:
         device = "cpu"
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable in this Python environment")
+    if args.data_parallel_gpus < 1:
+        raise ValueError('--data-parallel-gpus must be positive')
+    if args.data_parallel_gpus > 1 and (device != 'cuda' or
+                                       torch.cuda.device_count() < args.data_parallel_gpus):
+        raise RuntimeError('The requested local CUDA devices are unavailable')
     rng = torch.Generator().manual_seed(args.seed)
     raw, (train, train_labels), (test, test_labels) = load_dataset(args.dataset, args.data_root)
     image_shape = dataset_image_shape(args.dataset)
@@ -401,6 +408,12 @@ def main(default_dataset: str = "cifar10") -> None:
     if args.init_checkpoint and restore_path is None:
         initialization = initialize_from_checkpoint(model, ema_model, args.init_checkpoint, args)
     evaluation_model = ema_model if ema_model is not None else model
+    training_model = model
+    if args.data_parallel_gpus > 1:
+        devices = list(range(args.data_parallel_gpus))
+        training_model = torch.nn.DataParallel(model, device_ids=devices)
+        evaluation_model = torch.nn.DataParallel(evaluation_model, device_ids=devices).train(evaluation_model.training)
+        print(f'Generator data parallelism: {devices}; global particle loss on cuda:0', flush=True)
     x = evaluation_images(evaluation_model, eval_latent)
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / "config.json").exists() and args.resume is None:
@@ -590,7 +603,8 @@ def main(default_dataset: str = "cifar10") -> None:
                                corruption_level=0.8, init_checkpoint=None, train_particles=None,
                                random_flip=False, lr_schedule='constant', min_learning_rate=0.0,
                                schedule_start_update=0, no_field_rms_normalization=False,
-                               sinkhorn_mode='wflow', sinkhorn_tolerance=1e-6)
+                               sinkhorn_mode='wflow', sinkhorn_tolerance=1e-6,
+                               data_parallel_gpus=1)
         for key, value in vars(args).items():
             value = str(value) if isinstance(value, Path) else value
             if key == ('epochs' if unit == 'epoch' else 'steps'):
@@ -679,7 +693,7 @@ def main(default_dataset: str = "cifar10") -> None:
             if args.training_stage == 'reconstruction':
                 noise = torch.randn(batch.shape, generator=train_latent_rng).to(device)
                 step_diagnostics = reconstruction_step(
-                    model, batch, noise, optimizer, args.corruption_level, args.max_grad_norm)
+                    training_model, batch, noise, optimizer, args.corruption_level, args.max_grad_norm)
                 training_stats['reconstruction_mse'] = training_stats.get('reconstruction_mse', 0) + step_diagnostics['reconstruction_mse']
                 training_updates += 1
                 if ema_model is not None:
@@ -691,7 +705,7 @@ def main(default_dataset: str = "cifar10") -> None:
             sinkhorn_latent = (torch.randn((args.train_particles or args.particles, args.latent_dim), generator=sinkhorn_rng).to(device)
                                if args.objective == 'sinkhorn' else None)
             step_diagnostics = generator_step(
-                model, train_latent, batch, optimizer, args.chunk_size,
+                training_model, train_latent, batch, optimizer, args.chunk_size,
                 objective=args.objective, tau_list=tuple(args.tau_list),
                 normalize_per_temperature=args.normalize_per_temperature,
                 multiscale_options=multiscale_options, target_options=target_options,
