@@ -171,6 +171,32 @@ class PrimingTests(unittest.TestCase):
             unchanged = torch.load(root / 'source/checkpoint_latest.pt', weights_only=False)
             self.assertEqual(unchanged['update_count'], source['update_count'])
 
+    def test_explicitly_shorten_priming_preserves_training_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            full = self.run_training(root / 'full', ['--epochs', '4'])
+            calls = 0
+
+            def interrupted(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 4:
+                    raise RuntimeError('stop after first epoch')
+                return reconstruction_step(*args, **kwargs)
+
+            with patch.object(main, 'reconstruction_step', side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, 'stop after first epoch'):
+                    self.run_training(root / 'shortened', ['--epochs', '80'])
+            resumed = self.run_training(root / 'shortened', ['--epochs', '4',
+                '--allow-shorter-budget', '--resume', str(root / 'shortened/checkpoint_latest.pt')])
+            self.assertEqual(resumed['config']['budget_change']['previous'], 80)
+            self.assertEqual(resumed['arguments']['epochs'], 4)
+            for key in ('model', 'ema_model'):
+                for name in full[key]:
+                    torch.testing.assert_close(full[key][name], resumed[key][name], rtol=0, atol=0)
+            for key in ('torch_rng', 'data_rng', 'latent_rng'):
+                self.assertTrue(torch.equal(full[key], resumed[key]))
+
     def test_continuation_schedule_and_flip(self):
         schedule = dict(schedule='cosine', minimum=5e-5, start=10, total=30)
         self.assertEqual(main.training_learning_rate(10, 1e-4, 2, **schedule), 1e-6)

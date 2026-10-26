@@ -237,6 +237,10 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
                         help='Continue in a new output directory with explicitly changed tuning settings')
     parser.add_argument('--keep-checkpoint-every', type=int, default=0,
                         help='Retain numbered checkpoints at this interval, plus the final checkpoint')
+    parser.add_argument('--save-ema-at-fid', action='store_true',
+                        help='Retain evaluation-only EMA weights and the score at every FID report')
+    parser.add_argument('--allow-shorter-budget', action='store_true',
+                        help='Explicitly allow resume with an earlier endpoint beyond the saved iteration')
     parser.add_argument("--training-stage", choices=("distributional", "reconstruction"),
                         default="distributional")
     parser.add_argument("--corruption-level", type=float, default=0.8,
@@ -297,6 +301,8 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         args.ema_decay = 0.999 if args.dataset == "cifar10" else 0.0
     if not math.isfinite(args.ema_decay) or not 0 <= args.ema_decay < 1:
         parser.error("--ema-decay must be finite and in [0, 1)")
+    if args.save_ema_at_fid and (args.dataset != 'cifar10' or not args.ema_decay):
+        parser.error('--save-ema-at-fid requires CIFAR-10 and an enabled EMA')
     image_dim = 784 if args.dataset == "mnist" else 3072
     if not math.isfinite(args.corruption_level) or not 0 <= args.corruption_level <= 1:
         parser.error('--corruption-level must be finite and in [0, 1]')
@@ -460,7 +466,8 @@ def main(default_dataset: str = "cifar10") -> None:
                   if args.save_snapshots else sorted(set(range(0, total_iterations + 1, args.save_every)) | {total_iterations}))
     config.update(lr_schedule=f'linear_warmup_then_{args.lr_schedule}',
                   training_generated_batch=args.train_particles or args.particles,
-                  training_random_horizontal_flip=args.random_flip)
+                  training_random_horizontal_flip=args.random_flip,
+                  checkpoint_at_fid=bool(args.checkpoint_every and args.dataset == 'cifar10'))
     if args.dataset == "cifar10":
         config["class_names"] = CIFAR10_CLASSES
     if initialization is not None:
@@ -577,7 +584,8 @@ def main(default_dataset: str = "cifar10") -> None:
         checkpoint = torch.load(restore_path, map_location='cpu', weights_only=False)
         if 'priming_initialization' in checkpoint['config']:
             config['priming_initialization'] = checkpoint['config']['priming_initialization']
-        ignored = {'resume', 'fork_checkpoint', 'threads', 'device', 'checkpoint_every', 'keep_checkpoint_every'}
+        ignored = {'resume', 'fork_checkpoint', 'threads', 'device', 'checkpoint_every',
+                   'keep_checkpoint_every', 'save_ema_at_fid', 'allow_shorter_budget'}
         tuning_keys = {'output', 'learning_rate', 'lr_schedule', 'min_learning_rate',
                        'schedule_start_update', 'warmup_steps', 'train_particles', 'random_flip',
                        'max_grad_norm', 'ema_decay', 'crops_per_size', 'global_loss_weight',
@@ -612,7 +620,10 @@ def main(default_dataset: str = "cifar10") -> None:
                 if previous_duration is None:
                     raise ValueError('Resume cannot change between steps and epochs')
                 if value < previous_duration:
-                    raise ValueError(f'Resume cannot shorten {key}')
+                    if not args.allow_shorter_budget or value <= checkpoint['iteration']:
+                        raise ValueError(f'Resume cannot shorten {key} without explicit permission and remaining iterations')
+                    config['budget_change'] = dict(previous=previous_duration, current=value,
+                                                 unit=unit, resumed_iteration=checkpoint['iteration'])
                 continue
             if key not in ignored and checkpoint['arguments'].get(key, legacy_defaults.get(key)) != value:
                 raise ValueError(f'Resume configuration mismatch for {key}')
@@ -818,9 +829,22 @@ def main(default_dataset: str = "cifar10") -> None:
                 save_trajectory(trajectory_states, trajectory_iterations, args.output,
                                 args.trajectory_particles, unit)
                 plot_mmd(history, args.output, unit, fid_history=fid_history)
+            if args.save_ema_at_fid and fid_evaluator is not None and iteration in save_iterations:
+                archive = args.output / 'fid_checkpoints'
+                archive.mkdir(exist_ok=True)
+                retained_ema = archive / f'ema_{unit}_{iteration:06d}.pt'
+                if not retained_ema.exists():
+                    ema_checkpoint = dict(checkpoint_kind='evaluation_only_ema',
+                        config=config, iteration=iteration, update_count=update_count,
+                        fid=float(fid_value), ema_model=ema_model.state_dict())
+                    temporary_ema = retained_ema.with_suffix('.pt.tmp')
+                    torch.save(ema_checkpoint, temporary_ema)
+                    temporary_ema.replace(retained_ema)
             retain_checkpoint = args.keep_checkpoint_every and (
                 iteration % args.keep_checkpoint_every == 0 or iteration == total_iterations)
-            if retain_checkpoint or args.checkpoint_every and (iteration % args.checkpoint_every == 0 or iteration == total_iterations):
+            fid_checkpoint = fid_evaluator is not None and iteration in save_iterations
+            if retain_checkpoint or args.checkpoint_every and (
+                    iteration % args.checkpoint_every == 0 or iteration == total_iterations or fid_checkpoint):
                 checkpoint = dict(
                     config=config,
                     arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},

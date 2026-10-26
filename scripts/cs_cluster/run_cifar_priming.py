@@ -24,10 +24,11 @@ def commands(repo, study):
               '--base-channels', '128', '--num-res-blocks', '4', '--latent-dim', '3072',
               '--objective', 'softmax-riesz', '--threads', '8', '--device', 'cuda',
               '--data-parallel-gpus', '4', '--fid-samples', '10000',
-              '--fid-batch-size', '64', '--trajectory-particles', '8']
+              '--fid-batch-size', '64', '--trajectory-particles', '8', '--save-ema-at-fid']
     return {
         'reconstruction': common + ['--training-stage', 'reconstruction',
-            '--corruption-level', '0.8', '--epochs', '80', '--target-batch-size', '64',
+            '--corruption-level', '0.8', '--epochs', '10', '--target-batch-size', '64',
+            '--allow-shorter-budget',
             '--ema-decay', '0.9999', '--save-every', '20', '--checkpoint-every', '1',
             '--output', str(study / 'reconstruction')],
         'posttraining': common + ['--steps', '1000000', '--target-batch-size', '256',
@@ -38,7 +39,7 @@ def commands(repo, study):
             '--global-loss-weight', '2', '--coarse-loss-weight', '1', '--patch-loss-weight', '1',
             '--no-field-rms-normalization', '--no-normalize-per-temperature',
             '--save-every', '2500', '--checkpoint-every', '1000',
-            '--keep-checkpoint-every', '25000', '--init-checkpoint',
+            '--init-checkpoint',
             str(study / 'reconstruction/checkpoint_latest.pt'),
             '--output', str(study / 'posttraining')],
     }
@@ -69,7 +70,7 @@ def main():
                     reference_commit='7a93ac4467cad2ad2b65e8018462c5c1585046d8',
                     job_id=os.environ.get('JOB_ID'), host=os.uname().nodename,
                     cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
-                    commands=stages, gpu_count=4, reconstruction_epochs=80,
+                    commands=stages, gpu_count=4, reconstruction_epochs=10,
                     posttraining_updates=1000000, field_rms_normalization='none')
     write_json(study / 'deployment.json', manifest)
 
@@ -92,7 +93,7 @@ def main():
             checkpoint = output / 'checkpoint_latest.pt'
             if checkpoint.exists():
                 saved = torch.load(checkpoint, map_location='cpu', weights_only=False, mmap=True)
-                complete = saved['iteration'] == (80 if stage == 'reconstruction' else 1000000)
+                complete = saved['iteration'] == (10 if stage == 'reconstruction' else 1000000)
                 del saved
                 if complete:
                     status('complete', stage)
@@ -104,15 +105,15 @@ def main():
                 log.write(shlex.join(command) + '\n')
                 subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
             saved = torch.load(checkpoint, map_location='cpu', weights_only=False, mmap=True)
-            expected = 62560 if stage == 'reconstruction' else 1000000
+            expected = 7820 if stage == 'reconstruction' else 1000000
             assert saved['update_count'] == expected
             assert saved['config']['data_parallel_gpus'] == 4
             if stage == 'posttraining':
                 assert saved['config']['softmax_field_normalization'] == 'none'
-                assert saved['config']['priming_initialization']['source_updates'] == 62560
+                assert saved['config']['priming_initialization']['source_updates'] == 7820
             del saved
             fid = json.loads((output / 'fid_metrics.json').read_text())
-            assert fid[-1]['iteration'] == (80 if stage == 'reconstruction' else 1000000)
+            assert fid[-1]['iteration'] == (10 if stage == 'reconstruction' else 1000000)
             status('complete', stage, updates=expected)
         status('complete', posttraining_updates=1000000)
     except BaseException as error:

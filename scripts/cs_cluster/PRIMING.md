@@ -1,7 +1,7 @@
 # Four-H100 CIFAR-10 priming
 
 This launcher adapts the Penn LSF recipe at `7a93ac4`. It runs fresh
-reconstruction priming for 80 epochs (62,560 updates, corruption 0.8, batch 64),
+reconstruction priming for 10 epochs (7,820 updates, corruption 0.8, batch 64),
 then 1,000,000 softmax-Riesz updates without field RMS normalization. It retains
 distance scaling and the three temperatures 0.2/0.05/0.02.
 
@@ -9,8 +9,13 @@ Post-training uses global generated/real batches 128/256, horizontal flips,
 multiscale weights 2:1:1, four crops per size, clipping at norm 1, Adam,
 EMA 0.9999, and seed 42. Learning rate warms up for 1,000 steps to 2e-4,
 then follows cosine decay to 1e-4 over the full million updates.
-FID-10K runs every 2,500 steps, recovery checkpoints every 1,000 steps, and
-numbered checkpoints every 25,000 steps. Reconstruction retains the original
+FID-10K runs every 2,500 steps. The latest resumable checkpoint is saved every
+1,000 steps and at every FID report. Evaluation-only EMA weights are retained
+at every FID report under `fid_checkpoints/`; these files include the exact score,
+iteration, update count, and config but no optimizer state. Numbered full
+checkpoints are disabled to fit the complete million-step run in the available
+storage. Scores are stored in `fid_metrics.json`, `metrics.csv`, and the checkpoint's
+`fid_history`. Reconstruction retains the original
 constant 2e-4 learning rate and EMA 0.9999.
 
 `--data-parallel-gpus 4` splits generator forwards across the four allocated
@@ -36,3 +41,5 @@ hashes and exact commands in `deployment.json`, and stage-specific logs,
 configs, status, metrics, and checkpoints. Resubmitting the same study resumes
 its latest checkpoint and skips a completed stage; an advisory lock prevents
 concurrent writers. No Penn checkpoint is copied: priming runs fresh on CS.
+The reconstruction command explicitly permits shortening the original 80-epoch
+budget on resume, preserving its model, EMA, optimizer, and random states.
