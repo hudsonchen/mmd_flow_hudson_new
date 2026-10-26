@@ -34,6 +34,50 @@ outputs are stored under `results/cifar/`.
 
 ## Run experiments
 
+### Reconstruction priming (two-stage CIFAR-10)
+
+The optional reconstruction stage adapts Eq. (1) of
+[Are We Overthinking One-Step Generation?](https://arxiv.org/abs/2610.20331).
+It trains the existing generator on paired noisy/clean images at fixed `s=0.8`.
+For stored pixels `x` in `[0,1]`, inputs are `(1-s)*(2*x-1) + s*noise`,
+with standard Gaussian noise; the sigmoid output predicts `x` using mean MSE.
+There is no time input. The centered input convention matches the paper's
+noise scale; the output and MSE retain this repo's `[0,1]` convention.
+
+```bash
+python main.py --dataset cifar10 --data-root data --target-size 0 \
+  --training-stage reconstruction --corruption-level 0.8 \
+  --epochs 80 --target-batch-size 64 --particles 64 --seed 42 \
+  --ema-decay 0.9999 --save-every 20 --checkpoint-every 1 \
+  --device cuda --output results/cifar/priming/reconstruction
+
+python main.py --dataset cifar10 --data-root data --target-size 0 \
+  --init-checkpoint results/cifar/priming/reconstruction/checkpoint_latest.pt \
+  --objective softmax-riesz --multiscale-loss --steps 250000 \
+  --target-batch-size 256 --particles 64 --seed 42 --ema-decay 0.999 \
+  --save-every 2500 --checkpoint-every 1000 \
+  --device cuda --output results/cifar/priming/posttraining
+```
+
+Initialization requires a completed, compatible reconstruction checkpoint.
+It transfers **online weights and the pretrained EMA shadow**, starts a fresh
+optimizer and post-training random streams, and records the source checkpoint
+SHA-256 in `config.json`. `--resume` instead restores the entire interrupted run,
+including optimizer, random streams, metrics, and EMA. For a resumed post-training
+run, keep its original `--init-checkpoint` argument alongside `--resume`.
+
+The reconstruction CSV adds training MSE and fixed-noise held-out MSE at saved
+snapshots. FID always measures generation from **pure Gaussian noise**, including
+during reconstruction; it does not evaluate reconstructions. Checkpoints are
+written atomically when `--checkpoint-every` is enabled.
+
+This first experiment deliberately retains the existing unconditional DDPM++
+network, Adam optimizer, and multiscale pixel-space softmax-Riesz loss. It uses
+plain reconstruction MSE, without perceptual losses. It tests the two-stage idea;
+it does not reproduce the paper's conditional ImageNet feature-space OT recipe.
+See [the LSF launcher](scripts/lsf/README.md) for the current cluster's two-stage
+submission workflow.
+
 ```bash
 bash run.sh                                  # CIFAR-10, RGB U-Net, softmax Riesz
 DATASET=mnist bash run.sh                     # MNIST, compact U-Net, softmax Riesz
@@ -167,6 +211,16 @@ particles participate; there is no hard top-k truncation. Each temperature
 field is RMS-normalized before summation, then the generator regresses toward
 a detached goal in batch-scaled coordinates. `--tau-list` controls temperatures;
 `--no-normalize-per-temperature` selects upstream's combined-field normalization.
+`--no-field-rms-normalization` bypasses both field RMS normalizations while
+retaining batch-distance coordinate scaling, softmax temperatures, unit
+directions, and the `1/tau` factors. This softmax-only ablation records raw
+combined/per-temperature field RMS, attraction/repulsion RMS, pre-clipping
+parameter gradient norm, and clipping frequency in `training_diagnostics.csv`.
+Rows average updates in intervals of at most 100 updates (also flushed at
+checkpoints and completion); field magnitudes first average equally over active
+views. `clip_fraction` is the fraction of updates exceeding the configured
+gradient norm threshold, not a fraction of parameters. Learning rate is the
+last rate in each interval. The existing modes retain their behavior.
 
 `loss.backpropagate_objective` dispatches the Riesz and Drifting training rules. Softmax Riesz's
 regression surrogate is distinct from the ordinary Riesz energy. Both are
@@ -235,7 +289,8 @@ run-level plots show its square root, without smoothing. This is a pixel-space
 diagnostic. The field RMS column
 uses the objective-specific convention recorded in the configuration.
 Only fixed evaluation outputs are recomputed at each epoch, avoiding a second
-large-model forward pass per training minibatch. No `.pt` checkpoints are saved.
+large-model forward pass per training minibatch. Set `--checkpoint-every N` to
+save resumable checkpoints; the two-stage launchers enable this automatically.
 Passed smoke-test outputs are removed; full experiment artifacts are retained.
 
 ### CIFAR-10 FID

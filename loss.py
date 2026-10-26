@@ -90,6 +90,7 @@ def _riesz_topk_softmax_loss_impl(
     rms_epsilon: float = 1e-8,
     direction_epsilon: float = 1e-8,
     normalize_per_temperature: bool = False,
+    no_field_rms_normalization: bool = False,
     return_field: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Regress toward the detached, RMS-normalized softmax Riesz velocity.
@@ -103,6 +104,8 @@ def _riesz_topk_softmax_loss_impl(
     With ``normalize_per_temperature``, each temperature field is instead
     divided by its own RMS before summation, as in Drifting. This mode uses
     Drifting's squared-RMS floor of ``1e-8`` and no final normalization.
+    With no_field_rms_normalization, neither field RMS normalization is applied;
+    batch-distance coordinate scaling and softmax temperatures are unchanged.
     The legacy total-field RMS floor is applied after the square root. Target
     weights multiply the normalized softmax averages, preserving the training
     code's CFG coefficients. The generated particle itself is excluded from
@@ -214,7 +217,7 @@ def _riesz_topk_softmax_loss_impl(
                 + temperature_fixed_negative
             )
             temperature_rms = _rms(temperature_field)
-            if normalize_per_temperature:
+            if normalize_per_temperature and not no_field_rms_normalization:
                 temperature_scale = torch.sqrt(
                     torch.clamp(temperature_field.square().mean(), min=1e-8)
                 )
@@ -233,7 +236,8 @@ def _riesz_topk_softmax_loss_impl(
         force_rms = _rms(raw_field)
         force_scale = torch.clamp(force_rms, min=float(rms_epsilon))
         frozen_velocity = (
-            raw_field if normalize_per_temperature else raw_field / force_scale
+            raw_field if normalize_per_temperature or no_field_rms_normalization
+            else raw_field / force_scale
         ).detach()
         goal_scaled = (old_gen_scaled + frozen_velocity).detach()
 
@@ -283,6 +287,16 @@ else:
 
 # Keep the conventional ``*_loss`` spelling available to callers as well.
 riesz_topk_softmax_loss = riesz_topk_softmax
+
+
+def raw_field_diagnostics(info):
+    """Scalar magnitudes for calls with no_field_rms_normalization=True."""
+    prefix = 'riesz_topk_softmax_'
+    result = {f'raw_{name}': info[prefix + name] for name in
+              ('force_rms', 'attraction_rms', 'self_repulsion_rms')}
+    result.update({name.replace(prefix, 'raw_'): value for name, value in info.items()
+                   if name.startswith(prefix + 'force_rms_tau_')})
+    return result
 
 
 

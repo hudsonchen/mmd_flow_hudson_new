@@ -8,7 +8,7 @@ from loss import _riesz_topk_softmax_loss_impl, velocity, drifting_loss, sinkhor
 def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
                         normalize_per_temperature, target_options=None,
                         reference=None, sinkhorn_epsilon=0.05, sinkhorn_iters=10,
-                        diagnostics=None):
+                        diagnostics=None, no_field_rms_normalization=False):
     target = target.detach()
     if objective == 'sinkhorn':
         value, info = sinkhorn_target_loss(
@@ -23,14 +23,23 @@ def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
     if objective == 'softmax-riesz':
         if target_options:
             from target_updates import softmax_target_loss
-            value, _ = softmax_target_loss(
+            value, info = softmax_target_loss(
                 features, target, tau_list=tau_list,
-                normalize_per_temperature=normalize_per_temperature, **target_options)
+                normalize_per_temperature=normalize_per_temperature,
+                no_field_rms_normalization=no_field_rms_normalization, **target_options)
+            if diagnostics is not None:
+                for name, result in info.items():
+                    diagnostics.setdefault(name, []).append(result)
             return value
         # Preserve upstream's batch-distance and per-coordinate normalization.
-        value, _ = _riesz_topk_softmax_loss_impl(
+        value, info = _riesz_topk_softmax_loss_impl(
             features.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list,
-            normalize_per_temperature=normalize_per_temperature, epsilon=1e-6)
+            normalize_per_temperature=normalize_per_temperature, epsilon=1e-6,
+            no_field_rms_normalization=no_field_rms_normalization)
+        if diagnostics is not None and no_field_rms_normalization:
+            from loss import raw_field_diagnostics
+            for name, result in raw_field_diagnostics(info).items():
+                diagnostics.setdefault(name, []).append(result)
         return value.mean()
     if objective == 'riesz':
         # RMS pixel geometry avoids distance growth solely from view dimension.
@@ -47,7 +56,8 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                     patch_sizes=(7, 14), crops_per_size=1, patch_rng=None,
                     global_weight=1.0, coarse_weight=1.0, patch_weight=1.0,
                     target_options=None, reference_images=None,
-                    sinkhorn_epsilon=0.05, sinkhorn_iters=10):
+                    sinkhorn_epsilon=0.05, sinkhorn_iters=10,
+                    no_field_rms_normalization=False):
     """Return a weighted loss and detached group diagnostics.
 
     Crop coordinates are shared across generated/real populations, without
@@ -77,7 +87,8 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                                    target_options=target_options,
                                    reference=ref.flatten(1) if ref is not None else None,
                                    sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
-                                   diagnostics=diagnostics)
+                                   diagnostics=diagnostics,
+                                   no_field_rms_normalization=no_field_rms_normalization)
 
     groups = {}
     if global_weight:

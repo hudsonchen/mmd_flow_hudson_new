@@ -27,13 +27,13 @@ def download_mnist(root: Path) -> Path:
     raw.mkdir(parents=True, exist_ok=True)
     for name, checksum in FILES.items():
         path = raw / name
-        if path.exists() and hashlib.md5(path.read_bytes()).hexdigest() == checksum:
+        if path.exists() and hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest() == checksum:
             continue
         temporary = path.with_suffix(".gz.part")
         print(f"Downloading {name} to {path}", flush=True)
         try:
             urllib.request.urlretrieve(BASE_URL + name, temporary)
-            if hashlib.md5(temporary.read_bytes()).hexdigest() != checksum:
+            if hashlib.md5(temporary.read_bytes(), usedforsecurity=False).hexdigest() != checksum:
                 raise RuntimeError(f"MNIST checksum mismatch: {name}")
             temporary.replace(path)
         finally:
@@ -87,14 +87,14 @@ def download_cifar10(root: Path) -> Path:
     candidates = [archive, archive.with_name('cifar-10-python.tar.gz'),
                   root / 'cifar-10-python.tar.gz']
     for candidate in candidates:
-        if candidate.exists() and hashlib.md5(candidate.read_bytes()).hexdigest() == CIFAR10_ARCHIVES[candidate.name]:
+        if candidate.exists() and hashlib.md5(candidate.read_bytes(), usedforsecurity=False).hexdigest() == CIFAR10_ARCHIVES[candidate.name]:
             return candidate
     archive.parent.mkdir(parents=True, exist_ok=True)
     temporary = archive.with_suffix('.gz.part')
     print(f'Downloading CIFAR-10 to {archive}', flush=True)
     try:
         urllib.request.urlretrieve(CIFAR10_URL, temporary)
-        if hashlib.md5(temporary.read_bytes()).hexdigest() != CIFAR10_MD5:
+        if hashlib.md5(temporary.read_bytes(), usedforsecurity=False).hexdigest() != CIFAR10_MD5:
             raise RuntimeError('CIFAR-10 checksum mismatch')
         temporary.replace(archive)
     finally:
@@ -115,7 +115,7 @@ def decode_binary_batch(data: bytes) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def load_cifar10_split(archive: Path, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    if hashlib.md5(archive.read_bytes()).hexdigest() != CIFAR10_ARCHIVES.get(archive.name):
+    if hashlib.md5(archive.read_bytes(), usedforsecurity=False).hexdigest() != CIFAR10_ARCHIVES.get(archive.name):
         raise RuntimeError('CIFAR-10 checksum mismatch')
     binary = archive.name == CIFAR10_FILENAME
     suffix = '.bin' if binary else ''

@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import time
 import torch
@@ -16,9 +17,11 @@ from backbone import build_backbone, backbone_metadata
 from data import (FILES, CIFAR10_ARCHIVES, CIFAR10_CLASSES, download_mnist,
                   download_cifar10, load_dataset, image_shape as dataset_image_shape)
 from loss import (backpropagate_objective, mean_distance, mmd_squared, velocity,
-                  _riesz_topk_softmax_loss_impl, drifting_loss, sinkhorn_target_loss)
+                  _riesz_topk_softmax_loss_impl, drifting_loss, sinkhorn_target_loss,
+                  raw_field_diagnostics)
 from visualization import save_grid, save_trajectory, plot_mmd
 from multiscale import multiscale_loss
+from priming import reconstruction_step, initialize_from_checkpoint, reconstruction_error
 
 
 @torch.no_grad()
@@ -49,7 +52,8 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
                    target_options: dict | None = None,
                    sinkhorn_latent: torch.Tensor | None = None,
                    sinkhorn_epsilon: float = 0.05, sinkhorn_iters: int = 10,
-                   max_grad_norm: float = 0.0) -> dict:
+                   max_grad_norm: float = 0.0,
+                   no_field_rms_normalization: bool = False) -> dict:
     """Backpropagate the chosen particle-field rule through the generator.
 
     Ordinary Riesz uses the exact half-MMD image gradient -velocity/N.
@@ -73,8 +77,16 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
         from target_updates import softmax_target_loss
         loss, diagnostics = softmax_target_loss(
             images, target, tau_list=tau_list,
-            normalize_per_temperature=normalize_per_temperature, **target_options)
+            normalize_per_temperature=normalize_per_temperature,
+            no_field_rms_normalization=no_field_rms_normalization, **target_options)
         loss.backward()
+    elif multiscale_options is None and objective == 'softmax-riesz' and no_field_rms_normalization:
+        loss, info = _riesz_topk_softmax_loss_impl(
+            images.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list,
+            normalize_per_temperature=normalize_per_temperature,
+            no_field_rms_normalization=True, epsilon=1e-6)
+        loss.mean().backward()
+        diagnostics = raw_field_diagnostics(info)
     elif multiscale_options is None:
         backpropagate_objective(images, target, chunk_size, objective=objective,
                                 tau_list=tau_list, normalize_per_temperature=normalize_per_temperature)
@@ -84,10 +96,17 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
             tau_list=tau_list, normalize_per_temperature=normalize_per_temperature,
             target_options=target_options, reference_images=reference_images,
             sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
+            no_field_rms_normalization=no_field_rms_normalization,
             **multiscale_options)
         loss.backward()
-    if max_grad_norm:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    if max_grad_norm or no_field_rms_normalization:
+        norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_grad_norm or float('inf'),
+            error_if_nonfinite=no_field_rms_normalization)
+        if no_field_rms_normalization:
+            diagnostics.update(grad_norm_before_clip=norm.detach(),
+                               clip_fraction=(norm > max_grad_norm).float() if max_grad_norm
+                               else norm.new_zeros(()))
     optimizer.step()
     return diagnostics
 
@@ -97,11 +116,22 @@ def snapshot_steps(steps: int, intervals: int) -> set[int]:
     return {0, *(math.ceil(steps * index / intervals) for index in range(1, intervals + 1))}
 
 
-def training_learning_rate(update: int, peak: float, warmup_steps: int) -> float:
+def training_learning_rate(update: int, peak: float, warmup_steps: int, *,
+                           schedule='constant', minimum=0.0, start=0, total=None) -> float:
     """Released W-Flow/Drifting schedule, indexed by completed updates."""
-    if update < warmup_steps:
-        return 1e-6 + (peak - 1e-6) * update / warmup_steps
+    age = max(0, update - start)
+    if age < warmup_steps:
+        return 1e-6 + (peak - 1e-6) * age / warmup_steps
+    if schedule == 'cosine':
+        progress = min(1.0, (age - warmup_steps) / max(1, total - start - warmup_steps))
+        return minimum + .5 * (peak - minimum) * (1 + math.cos(math.pi * progress))
     return peak
+
+
+def horizontal_flip_batch(batch, image_shape):
+    images = batch.reshape(-1, *image_shape)
+    flips = torch.rand(len(images), device=batch.device) < .5
+    return torch.where(flips[:, None, None, None], images.flip(-1), images).reshape_as(batch)
 
 
 
@@ -134,6 +164,12 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     duration.add_argument("--steps", type=int, default=None, help="Number of individual updates")
     duration.add_argument("--epochs", type=int, default=None, help="Number of full passes over the target dataset")
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument('--lr-schedule', choices=('constant', 'cosine'), default='constant')
+    parser.add_argument('--min-learning-rate', type=float, default=0.0)
+    parser.add_argument('--schedule-start-update', type=int, default=0)
+    parser.add_argument('--train-particles', type=int,
+                        help='Generated training batch; defaults to --particles, which also controls diagnostics')
+    parser.add_argument('--random-flip', action='store_true', help='Horizontal flips on training images only')
     parser.add_argument("--optimizer", choices=("Adam", "AdamW"), default="Adam")
     parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -156,6 +192,8 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--tau-list", type=float, nargs="+", default=[0.2, 0.05, 0.02])
     parser.add_argument("--normalize-per-temperature", action=argparse.BooleanOptionalAction,
                         default=True, help="Normalize each softmax field before summing")
+    parser.add_argument('--no-field-rms-normalization', action='store_true',
+                        help='Bypass both softmax field RMS normalizations; retain batch-distance scaling')
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--multiscale-loss", action="store_true",
                         help="Combine full-image, coarse-image and aligned patch objectives")
@@ -173,6 +211,16 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
                         help="Save a resumable latest checkpoint every N iterations; 0 disables")
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume the same output directory from its latest checkpoint")
+    parser.add_argument('--fork-checkpoint', type=Path,
+                        help='Continue in a new output directory with explicitly changed tuning settings')
+    parser.add_argument('--keep-checkpoint-every', type=int, default=0,
+                        help='Retain numbered checkpoints at this interval, plus the final checkpoint')
+    parser.add_argument("--training-stage", choices=("distributional", "reconstruction"),
+                        default="distributional")
+    parser.add_argument("--corruption-level", type=float, default=0.8,
+                        help="Fixed reconstruction corruption: (1-s)*(2*image-1) + s*noise")
+    parser.add_argument("--init-checkpoint", type=Path, default=None,
+                        help="Start a new distributional run from online weights and inherited EMA; fresh optimizer")
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--save-snapshots", type=int, default=None,
                         help="Save this many evenly spaced intervals plus initialization; overrides save-every")
@@ -182,6 +230,11 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    if args.resume and args.fork_checkpoint:
+        parser.error('--resume and --fork-checkpoint are mutually exclusive')
+    if (args.train_particles is not None and args.train_particles < 1
+            or args.keep_checkpoint_every < 0 or args.schedule_start_update < 0):
+        parser.error('Invalid training batch, checkpoint retention, or schedule start')
     if (not 0 <= args.adam_beta2 < 1 or args.warmup_steps < 0
             or not math.isfinite(args.weight_decay) or args.weight_decay < 0
             or not math.isfinite(args.max_grad_norm) or args.max_grad_norm < 0):
@@ -194,6 +247,10 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         parser.error("invalid field step, noise levels, or checkpoint interval")
     if args.objective == 'drifting' and not args.normalize_per_temperature:
         parser.error('The official Drifting loss requires per-temperature normalization')
+    if args.no_field_rms_normalization:
+        if args.objective != 'softmax-riesz' or args.training_stage != 'distributional':
+            parser.error('--no-field-rms-normalization requires distributional softmax-riesz')
+        args.normalize_per_temperature = False
     if args.objective != 'softmax-riesz' and (
             args.field_step != 1 or args.noise_levels != [0.0]):
         parser.error("target-update experiments require --objective softmax-riesz")
@@ -201,11 +258,17 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         parser.error("FID needs at least two samples and a positive batch size")
     if args.learning_rate is None:
         args.learning_rate = 1e-3 if args.dataset == "mnist" else 2e-4
+    if not math.isfinite(args.min_learning_rate) or not 0 <= args.min_learning_rate <= args.learning_rate:
+        parser.error('Minimum learning rate must be between zero and the peak learning rate')
     if args.ema_decay is None:
         args.ema_decay = 0.999 if args.dataset == "cifar10" else 0.0
     if not math.isfinite(args.ema_decay) or not 0 <= args.ema_decay < 1:
         parser.error("--ema-decay must be finite and in [0, 1)")
     image_dim = 784 if args.dataset == "mnist" else 3072
+    if not math.isfinite(args.corruption_level) or not 0 <= args.corruption_level <= 1:
+        parser.error('--corruption-level must be finite and in [0, 1]')
+    if args.init_checkpoint and args.training_stage != 'distributional':
+        parser.error('--init-checkpoint is for distributional post-training')
     if args.output is None:
         args.output = Path("results") / ("mnist" if args.dataset == "mnist" else "cifar") / f"{args.dataset}_riesz_p1"
     if args.base_channels is None:
@@ -220,6 +283,10 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         args.latent_dim = image_dim if args.architecture == "unet" else 32
     if args.architecture == "unet" and args.latent_dim != image_dim:
         parser.error(f"the {args.dataset} U-Net requires --latent-dim {image_dim}")
+    if args.training_stage == 'reconstruction' and args.latent_dim != image_dim:
+        parser.error('Reconstruction requires image-dimensional inputs')
+    if args.training_stage == 'reconstruction' and (args.multiscale_loss or args.noise_levels != [0.0]):
+        parser.error('Distributional view/noise options do not apply to reconstruction')
     if args.steps is None and args.epochs is None:
         args.steps = 2000
     for key in ("particles", "eval_size", "chunk_size", "save_every", "threads", "trajectory_particles", "latent_dim", "base_channels", "num_res_blocks"):
@@ -249,6 +316,7 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
 
 def main(default_dataset: str = "cifar10") -> None:
     args = parse_args(default_dataset)
+    restore_path = args.resume or args.fork_checkpoint
     if args.download_only:
         raw = download_mnist(args.data_root) if args.dataset == "mnist" else download_cifar10(args.data_root)
         print(f"{args.dataset} downloaded and checksums verified: {raw}")
@@ -298,6 +366,9 @@ def main(default_dataset: str = "cifar10") -> None:
         model.parameters(), lr=args.learning_rate, betas=(0.9, args.adam_beta2),
         weight_decay=args.weight_decay)
     ema_model = copy.deepcopy(model).requires_grad_(False).eval() if args.ema_decay else None
+    initialization = None
+    if args.init_checkpoint and restore_path is None:
+        initialization = initialize_from_checkpoint(model, ema_model, args.init_checkpoint, args)
     evaluation_model = ema_model if ema_model is not None else model
     x = evaluation_images(evaluation_model, eval_latent)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -343,8 +414,21 @@ def main(default_dataset: str = "cifar10") -> None:
                   ema_initialization="copy_initial_model" if ema_model is not None else None,
                   snapshot_iterations=sorted(snapshot_steps(total_iterations, args.save_snapshots))
                   if args.save_snapshots else sorted(set(range(0, total_iterations + 1, args.save_every)) | {total_iterations}))
+    config.update(lr_schedule=f'linear_warmup_then_{args.lr_schedule}',
+                  training_generated_batch=args.train_particles or args.particles,
+                  training_random_horizontal_flip=args.random_flip)
     if args.dataset == "cifar10":
         config["class_names"] = CIFAR10_CLASSES
+    if initialization is not None:
+        config['priming_initialization'] = initialization
+    if args.training_stage == 'reconstruction':
+        config.update(training_rule='paired_denoising_mse', energy='mean_pixel_squared_error',
+                      priming_paper='https://arxiv.org/abs/2610.20331',
+                      reconstruction_input='(1-s)*(2*x_01-1) + s*N(0,I)',
+                      reconstruction_target='x_01; sigmoid output; mean MSE in [0,1]',
+                      reconstruction_adaptation='plain MSE; no perceptual loss; no class conditioning',
+                      reconstruction_eval_seed=args.seed + 7,
+                      training_latent_sampling='one_independent_noise_image_per_real_target')
     if args.multiscale_loss:
         config.update(training_view_geometry="full_image_and_average_pooled_images_and_aligned_crops",
                       patch_sampling_seed=args.seed + 2,
@@ -361,7 +445,15 @@ def main(default_dataset: str = "cifar10") -> None:
                       softmax_epsilon=1e-6, softmax_direction_epsilon=1e-8,
                       softmax_rms_epsilon=1e-8, softmax_feature_space="raw_pixels",
                       softmax_fixed_negatives=False,
-                      velocity_diagnostic="normalized_field_in_scaled_pixel_space")
+                      softmax_field_normalization=('none' if args.no_field_rms_normalization else
+                                                   'per_temperature' if args.normalize_per_temperature else 'combined'),
+                      velocity_diagnostic=('raw_field_in_scaled_pixel_space' if args.no_field_rms_normalization
+                                           else 'normalized_field_in_scaled_pixel_space'))
+        if args.no_field_rms_normalization:
+            config.update(training_diagnostics_file='training_diagnostics.csv',
+                          training_diagnostics_aggregation='arithmetic mean across active views, then updates in each logged interval',
+                          training_diagnostics_interval=100,
+                          clipping_diagnostic='fraction of updates whose pre-clip parameter gradient L2 norm exceeds max_grad_norm')
     elif args.objective == 'drifting':
         config.update(kernel='joint_row_column_softmax_geometric_mean',
                       drifting_reference_code='https://github.com/lambertae/drifting/blob/main/drift_loss.py',
@@ -401,7 +493,7 @@ def main(default_dataset: str = "cifar10") -> None:
                       fid_weights_sha256=hashlib.sha256(WEIGHTS.read_bytes()).hexdigest(),
                       fid_preprocessing="float [0,1]; bilinear 299x299 align_corners=False; scale to [-1,1]",
                       diagnostic_metric="biased_empirical_riesz_mmd_squared")
-    if args.resume is None:
+    if restore_path is None:
         (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     (args.output / "data_indices.json").write_text(json.dumps(
         {"train_indices": train_ids.tolist(), "test_indices": test_ids.tolist()}) + "\n")
@@ -416,22 +508,58 @@ def main(default_dataset: str = "cifar10") -> None:
     fid_history = []
     training_stats, training_updates = {}, 0
     loss_names = ('global', 'coarse', 'patch', 'combined') if args.multiscale_loss else ()
-    if args.objective == 'sinkhorn':
+    if args.training_stage == 'reconstruction':
+        loss_names = ('reconstruction_mse',)
+    elif args.objective == 'sinkhorn':
         loss_names += ('sinkhorn_velocity_raw_rms', 'sinkhorn_marginal_max_error')
     start_iteration, elapsed_offset = 0, 0.0
-    if args.resume is not None:
-        if not (args.output / 'config.json').exists():
+    if restore_path is not None:
+        if args.resume and not (args.output / 'config.json').exists():
             raise ValueError('Resume requires the original output directory and config.json')
-        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        ignored = {'resume', 'threads', 'device', 'checkpoint_every'}
+        checkpoint = torch.load(restore_path, map_location='cpu', weights_only=False)
+        if 'priming_initialization' in checkpoint['config']:
+            config['priming_initialization'] = checkpoint['config']['priming_initialization']
+        ignored = {'resume', 'fork_checkpoint', 'threads', 'device', 'checkpoint_every', 'keep_checkpoint_every'}
+        tuning_keys = {'output', 'learning_rate', 'lr_schedule', 'min_learning_rate',
+                       'schedule_start_update', 'warmup_steps', 'train_particles', 'random_flip',
+                       'max_grad_norm', 'ema_decay', 'crops_per_size', 'global_loss_weight',
+                       'coarse_loss_weight', 'patch_loss_weight'}
+        if args.fork_checkpoint:
+            ignored |= tuning_keys
+            if checkpoint['arguments'].get('training_stage', 'distributional') != 'distributional':
+                raise ValueError('Tuned continuation requires a distributional checkpoint')
+            if args.schedule_start_update != checkpoint['update_count']:
+                raise ValueError('Fork schedule must start at the source checkpoint update')
+            config['tuning_initialization'] = dict(
+                checkpoint=str(restore_path.resolve()), source_update=checkpoint['update_count'],
+                inherited_optimizer=True, inherited_ema=True,
+                changes={k: {'before': checkpoint['arguments'].get(k),
+                             'after': str(getattr(args, k)) if isinstance(getattr(args, k), Path)
+                             else getattr(args, k)} for k in sorted(tuning_keys)
+                         if checkpoint['arguments'].get(k) != (str(getattr(args, k))
+                             if isinstance(getattr(args, k), Path) else getattr(args, k))})
+        elif 'tuning_initialization' in checkpoint['config']:
+            config['tuning_initialization'] = checkpoint['config']['tuning_initialization']
         legacy_defaults = dict(optimizer='Adam', adam_beta2=0.999, weight_decay=0.0,
-                               warmup_steps=0, max_grad_norm=0.0)
+                               warmup_steps=0, max_grad_norm=0.0, training_stage='distributional',
+                               corruption_level=0.8, init_checkpoint=None, train_particles=None,
+                               random_flip=False, lr_schedule='constant', min_learning_rate=0.0,
+                               schedule_start_update=0, no_field_rms_normalization=False)
         for key, value in vars(args).items():
             value = str(value) if isinstance(value, Path) else value
+            if key == ('epochs' if unit == 'epoch' else 'steps'):
+                previous_duration = checkpoint['arguments'][key]
+                if previous_duration is None:
+                    raise ValueError('Resume cannot change between steps and epochs')
+                if value < previous_duration:
+                    raise ValueError(f'Resume cannot shorten {key}')
+                continue
             if key not in ignored and checkpoint['arguments'].get(key, legacy_defaults.get(key)) != value:
                 raise ValueError(f'Resume configuration mismatch for {key}')
         model.load_state_dict(checkpoint['model'])
         if ema_model is not None:
+            if checkpoint['ema_model'] is None:
+                raise ValueError('Continuation requires the source EMA state')
             ema_model.load_state_dict(checkpoint['ema_model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         torch.set_rng_state(checkpoint['torch_rng'])
@@ -451,7 +579,8 @@ def main(default_dataset: str = "cifar10") -> None:
         trajectory_iterations = checkpoint['trajectory_iterations']
         elapsed_offset = checkpoint['elapsed_seconds']
         # Remove rows written after the last durable checkpoint before appending.
-        with (args.output / 'metrics.csv').open(newline='') as previous:
+        metrics_source = (Path(checkpoint['arguments']['output']) if args.fork_checkpoint else args.output)
+        with (metrics_source / 'metrics.csv').open(newline='') as previous:
             rows = list(csv.reader(previous))
         with (args.output / 'metrics.csv').open('w', newline='') as previous:
             csv.writer(previous).writerows(
@@ -461,22 +590,58 @@ def main(default_dataset: str = "cifar10") -> None:
                 [{'iteration': i, 'fid': f} for i, f in fid_history], indent=2) + '\n')
         # The loop below starts with evaluation; perform the pending epoch first.
         resume_training = start_iteration <= total_iterations
+        (args.output / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
+        if args.fork_checkpoint:
+            fork_state = dict(checkpoint, config=config, arguments={
+                k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
+            temporary = args.output / 'checkpoint_latest.pt.tmp'
+            torch.save(fork_state, temporary)
+            temporary.replace(args.output / 'checkpoint_latest.pt')
+            if args.keep_checkpoint_every:
+                os.link(args.output / 'checkpoint_latest.pt',
+                        args.output / f'checkpoint_{unit}_{checkpoint["iteration"]:06d}.pt')
+            del fork_state
     else:
         resume_training = False
 
+    diagnostic_totals, diagnostic_count = {}, 0
+    diagnostic_path = args.output / 'training_diagnostics.csv'
+    if args.no_field_rms_normalization and diagnostic_path.exists():
+        with diagnostic_path.open(newline='') as previous:
+            diagnostic_rows = list(csv.reader(previous))
+        with diagnostic_path.open('w', newline='') as previous:
+            csv.writer(previous).writerows([diagnostic_rows[0]] +
+                [row for row in diagnostic_rows[1:] if int(row[0]) <= update_count])
+
     def train_iteration():
         nonlocal update_count, training_stats, training_updates
+        nonlocal diagnostic_totals, diagnostic_count
         batches = (epoch_batches(len(target), batch_size, rng) if unit == 'epoch'
                    else [torch.randperm(len(target), generator=rng)[:batch_size]])
         training_stats, training_updates = {}, 0
         for ids in batches:
-            learning_rate = training_learning_rate(update_count, args.learning_rate, args.warmup_steps)
+            learning_rate = training_learning_rate(
+                update_count, args.learning_rate, args.warmup_steps, schedule=args.lr_schedule,
+                minimum=args.min_learning_rate, start=args.schedule_start_update,
+                total=config['total_updates'])
             for group in optimizer.param_groups:
                 group['lr'] = learning_rate
             batch = target[ids.to(device)]
-            train_latent = torch.randn((args.particles, args.latent_dim),
+            if args.random_flip:
+                batch = horizontal_flip_batch(batch, image_shape)
+            if args.training_stage == 'reconstruction':
+                noise = torch.randn(batch.shape, generator=train_latent_rng).to(device)
+                step_diagnostics = reconstruction_step(
+                    model, batch, noise, optimizer, args.corruption_level, args.max_grad_norm)
+                training_stats['reconstruction_mse'] = training_stats.get('reconstruction_mse', 0) + step_diagnostics['reconstruction_mse']
+                training_updates += 1
+                if ema_model is not None:
+                    update_ema(model, ema_model, args.ema_decay)
+                update_count += 1
+                continue
+            train_latent = torch.randn((args.train_particles or args.particles, args.latent_dim),
                                        generator=train_latent_rng).to(device)
-            sinkhorn_latent = (torch.randn((args.particles, args.latent_dim), generator=sinkhorn_rng).to(device)
+            sinkhorn_latent = (torch.randn((args.train_particles or args.particles, args.latent_dim), generator=sinkhorn_rng).to(device)
                                if args.objective == 'sinkhorn' else None)
             step_diagnostics = generator_step(
                 model, train_latent, batch, optimizer, args.chunk_size,
@@ -484,26 +649,47 @@ def main(default_dataset: str = "cifar10") -> None:
                 normalize_per_temperature=args.normalize_per_temperature,
                 multiscale_options=multiscale_options, target_options=target_options,
                 sinkhorn_latent=sinkhorn_latent, sinkhorn_epsilon=args.sinkhorn_epsilon,
-                sinkhorn_iters=args.sinkhorn_iters, max_grad_norm=args.max_grad_norm)
+                sinkhorn_iters=args.sinkhorn_iters, max_grad_norm=args.max_grad_norm,
+                no_field_rms_normalization=args.no_field_rms_normalization)
             for name, value in step_diagnostics.items():
                 training_stats[name] = training_stats.get(name, 0) + float(value)
             training_updates += 1
             if ema_model is not None:
                 update_ema(model, ema_model, args.ema_decay)
             update_count += 1
+            if args.no_field_rms_normalization:
+                for name, value in step_diagnostics.items():
+                    if name.startswith('raw_') or name in ('grad_norm_before_clip', 'clip_fraction'):
+                        diagnostic_totals[name] = diagnostic_totals.get(name, 0.) + float(value)
+                diagnostic_count += 1
+                if (update_count % 100 == 0 or update_count == config['total_updates']
+                        or (args.checkpoint_every and
+                            (update_count % args.checkpoint_every == 0 if unit == 'step'
+                             else update_count % updates_per_iteration == 0))):
+                    row = dict(update=update_count, interval_updates=diagnostic_count,
+                               learning_rate=learning_rate,
+                               **{k: v / diagnostic_count for k, v in diagnostic_totals.items()})
+                    with diagnostic_path.open('a', newline='') as diagnostic_stream:
+                        diagnostic_writer = csv.DictWriter(diagnostic_stream, fieldnames=list(row))
+                        if diagnostic_stream.tell() == 0:
+                            diagnostic_writer.writeheader()
+                        diagnostic_writer.writerow(row)
+                    diagnostic_totals, diagnostic_count = {}, 0
 
     started = time.monotonic()
     if resume_training:
         train_iteration()
-    print(f"Neural {args.objective}: {config['architecture']}, {config['parameter_count']} parameters, "
+    print(f"Stage={args.training_stage}, neural {args.objective}: {config['architecture']}, {config['parameter_count']} parameters, "
           f"{len(x)} generated particles, {len(target)} targets, {device}", flush=True)
-    with (args.output / "metrics.csv").open("a" if args.resume else "w", newline="") as stream:
+    with (args.output / "metrics.csv").open("a" if restore_path else "w", newline="") as stream:
         writer = csv.writer(stream)
-        if args.resume is None:
+        if restore_path is None:
             writer.writerow(["iteration", "epoch", "update", "train_subset_mmd_squared", "heldout_mmd_squared",
                              "velocity_eval_subset_rms", "pixel_min", "pixel_max", "elapsed_seconds"]
                             + (["fid"] if fid_evaluator is not None else [])
-                            + [name if name.startswith('sinkhorn_') else f'train_{name}_surrogate'
+                            + (["heldout_reconstruction_mse"] if args.training_stage == 'reconstruction' else [])
+                            + [name if name.startswith('sinkhorn_') else
+                               ('train_reconstruction_mse' if name == 'reconstruction_mse' else f'train_{name}_surrogate')
                                for name in loss_names])
         for iteration in range(start_iteration, total_iterations + 1):
             if iteration > 0:
@@ -527,7 +713,8 @@ def main(default_dataset: str = "cifar10") -> None:
                     with torch.no_grad():
                         _, info = _riesz_topk_softmax_loss_impl(
                             x.unsqueeze(0), eval_train.unsqueeze(0), tau_list=args.tau_list,
-                            normalize_per_temperature=args.normalize_per_temperature, epsilon=1e-6)
+                            normalize_per_temperature=args.normalize_per_temperature, epsilon=1e-6,
+                            no_field_rms_normalization=args.no_field_rms_normalization)
                     speed = info["riesz_topk_softmax_velocity_rms"].item()
                 elif args.objective == 'drifting':
                     with torch.no_grad():
@@ -546,6 +733,10 @@ def main(default_dataset: str = "cifar10") -> None:
                                  train_mmd, test_mmd, speed,
                                  x.min().item(), x.max().item(), elapsed_offset + time.monotonic() - started]
                                 + ([fid_value] if fid_evaluator is not None else [])
+                                + ([reconstruction_error(evaluation_model, heldout, args.corruption_level,
+                                                         args.seed + 7, batch_size)
+                                    if iteration in save_iterations else '']
+                                   if args.training_stage == 'reconstruction' else [])
                                 + [float(training_stats[name]) / training_updates
                                    if name in training_stats else '' for name in loss_names])
                 stream.flush()
@@ -559,7 +750,9 @@ def main(default_dataset: str = "cifar10") -> None:
                 save_trajectory(trajectory_states, trajectory_iterations, args.output,
                                 args.trajectory_particles, unit)
                 plot_mmd(history, args.output, unit, fid_history=fid_history)
-            if args.checkpoint_every and (iteration % args.checkpoint_every == 0 or iteration == total_iterations):
+            retain_checkpoint = args.keep_checkpoint_every and (
+                iteration % args.keep_checkpoint_every == 0 or iteration == total_iterations)
+            if retain_checkpoint or args.checkpoint_every and (iteration % args.checkpoint_every == 0 or iteration == total_iterations):
                 checkpoint = dict(
                     config=config,
                     arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
@@ -577,6 +770,11 @@ def main(default_dataset: str = "cifar10") -> None:
                 temporary = args.output / 'checkpoint_latest.pt.tmp'
                 torch.save(checkpoint, temporary)
                 temporary.replace(args.output / 'checkpoint_latest.pt')
+                if retain_checkpoint:
+                    retained = args.output / f'checkpoint_{unit}_{iteration:06d}.pt'
+                    if not retained.exists():
+                        # Latest checkpoints are atomically replaced, so this inode stays immutable.
+                        os.link(args.output / 'checkpoint_latest.pt', retained)
             if iteration == total_iterations:
                 break
             train_iteration()
