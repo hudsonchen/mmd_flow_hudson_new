@@ -20,9 +20,14 @@ def main():
                         help='Use reconstruction weights with fresh optimizer/RNG at update zero')
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--min-learning-rate', type=float, default=5e-5)
-    parser.add_argument('--objective', choices=('softmax-riesz', 'riesz'),
+    parser.add_argument('--warmup-steps', type=int, default=1000)
+    parser.add_argument('--objective', choices=('softmax-riesz', 'riesz', 'sinkhorn'),
                         help='Override the objective from the saved argument recipe')
     parser.add_argument('--no-field-rms-normalization', action='store_true')
+    parser.add_argument('--sinkhorn-mode', choices=('wflow', 'ot'), default='wflow')
+    parser.add_argument('--sinkhorn-iters', type=int, default=10)
+    parser.add_argument('--sinkhorn-tolerance', type=float, default=1e-6)
+    parser.add_argument('--sinkhorn-ot-epsilon', type=float, default=None)
     args = parser.parse_args()
     if args.restart_from_priming and args.stage != 'posttraining':
         parser.error('--restart-from-priming requires --stage posttraining')
@@ -39,13 +44,17 @@ def main():
     output = args.study / args.stage
     options.update(output=str(output), steps=250000, learning_rate=args.learning_rate,
                    lr_schedule='cosine', min_learning_rate=args.min_learning_rate,
-                   schedule_start_update=record['source_update'], warmup_steps=1000,
+                   schedule_start_update=record['source_update'], warmup_steps=args.warmup_steps,
                    train_particles=128, random_flip=True, max_grad_norm=1., ema_decay=.9999,
                    crops_per_size=4, global_loss_weight=2., coarse_loss_weight=1.,
                    patch_loss_weight=1., checkpoint_every=1000, keep_checkpoint_every=25000,
                    resume=None, fork_checkpoint=record['checkpoint'])
     if args.objective is not None:
         options['objective'] = args.objective
+    if options['objective'] == 'sinkhorn':
+        options.update(sinkhorn_mode=args.sinkhorn_mode, sinkhorn_iters=args.sinkhorn_iters,
+                       sinkhorn_tolerance=args.sinkhorn_tolerance,
+                       sinkhorn_ot_epsilon=args.sinkhorn_ot_epsilon)
     if args.no_field_rms_normalization:
         if options['objective'] != 'softmax-riesz':
             parser.error('--no-field-rms-normalization requires softmax-riesz')
@@ -93,7 +102,9 @@ def main():
             subprocess.run([sys.executable, '-u', str(source / 'scripts/lsf/smoke_tuned_cifar.py'),
                             str(output / 'smoke.json'), str(args.learning_rate),
                             options['objective'],
-                            'none' if args.no_field_rms_normalization else 'per_temperature'],
+                            'none' if args.no_field_rms_normalization else 'per_temperature',
+                            args.sinkhorn_mode, str(args.sinkhorn_iters), str(args.sinkhorn_tolerance),
+                            str(args.sinkhorn_ot_epsilon) if args.sinkhorn_ot_epsilon is not None else 'none'],
                            stdout=stream, stderr=subprocess.STDOUT, check=True)
             subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, check=True)
         saved = torch.load(output / 'checkpoint_latest.pt', map_location='cpu', weights_only=False, mmap=True)

@@ -18,7 +18,7 @@ from data import (FILES, CIFAR10_ARCHIVES, CIFAR10_CLASSES, download_mnist,
                   download_cifar10, load_dataset, image_shape as dataset_image_shape)
 from loss import (backpropagate_objective, mean_distance, mmd_squared, velocity,
                   _riesz_topk_softmax_loss_impl, drifting_loss, sinkhorn_target_loss,
-                  raw_field_diagnostics)
+                  raw_field_diagnostics, sinkhorn_ot_loss)
 from visualization import save_grid, save_trajectory, plot_mmd
 from multiscale import multiscale_loss
 from priming import reconstruction_step, initialize_from_checkpoint, reconstruction_error
@@ -53,7 +53,9 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
                    sinkhorn_latent: torch.Tensor | None = None,
                    sinkhorn_epsilon: float = 0.05, sinkhorn_iters: int = 10,
                    max_grad_norm: float = 0.0,
-                   no_field_rms_normalization: bool = False) -> dict:
+                   no_field_rms_normalization: bool = False,
+                   sinkhorn_mode: str = 'wflow', sinkhorn_tolerance: float = 1e-6,
+                   sinkhorn_ot_epsilon: float | None = None) -> dict:
     """Backpropagate the chosen particle-field rule through the generator.
 
     Ordinary Riesz uses the exact half-MMD image gradient -velocity/N.
@@ -70,8 +72,12 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
             reference_images = model(sinkhorn_latent)
     diagnostics = {}
     if multiscale_options is None and objective == 'sinkhorn':
-        loss, diagnostics = sinkhorn_target_loss(
-            images, target, reference_images, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
+        if sinkhorn_mode == 'ot':
+            loss, diagnostics = sinkhorn_ot_loss(images, target, reference_images,
+                iterations=sinkhorn_iters, tolerance=sinkhorn_tolerance, epsilon=sinkhorn_ot_epsilon)
+        else:
+            loss, diagnostics = sinkhorn_target_loss(
+                images, target, reference_images, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
         loss.backward()
     elif multiscale_options is None and target_options:
         from target_updates import softmax_target_loss
@@ -97,17 +103,27 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
             target_options=target_options, reference_images=reference_images,
             sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
             no_field_rms_normalization=no_field_rms_normalization,
+            sinkhorn_mode=sinkhorn_mode, sinkhorn_tolerance=sinkhorn_tolerance,
+            sinkhorn_ot_epsilon=sinkhorn_ot_epsilon,
             **multiscale_options)
         loss.backward()
-    if max_grad_norm or no_field_rms_normalization:
+    record_sinkhorn_diagnostics = objective == 'sinkhorn'
+    if max_grad_norm or no_field_rms_normalization or record_sinkhorn_diagnostics:
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_grad_norm or float('inf'),
-            error_if_nonfinite=no_field_rms_normalization)
-        if no_field_rms_normalization:
+            error_if_nonfinite=no_field_rms_normalization or record_sinkhorn_diagnostics)
+        if no_field_rms_normalization or record_sinkhorn_diagnostics:
             diagnostics.update(grad_norm_before_clip=norm.detach(),
                                clip_fraction=(norm > max_grad_norm).float() if max_grad_norm
                                else norm.new_zeros(()))
+    before_step = [p.detach().clone() for p in model.parameters()] if record_sinkhorn_diagnostics else None
     optimizer.step()
+    if before_step is not None:
+        with torch.no_grad():
+            delta_squared = torch.stack([(p - old).square().sum()
+                                         for p, old in zip(model.parameters(), before_step)]).sum()
+            weight_squared = torch.stack([old.square().sum() for old in before_step]).sum()
+            diagnostics['parameter_update_relative_norm'] = (delta_squared / weight_squared.clamp_min(1e-30)).sqrt()
     return diagnostics
 
 
@@ -189,6 +205,12 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--sinkhorn-epsilon", type=float, default=0.05,
                         help="Dimension-relative entropic regularization for quadratic Sinkhorn")
     parser.add_argument("--sinkhorn-iters", type=int, default=10)
+    parser.add_argument('--sinkhorn-mode', choices=('wflow', 'ot'), default='wflow',
+                        help='Normalized W-Flow regression or direct detached-plan OT epsilon mixture')
+    parser.add_argument('--sinkhorn-tolerance', type=float, default=1e-6,
+                        help='Absolute marginal tolerance for direct OT; zero uses all iterations')
+    parser.add_argument('--sinkhorn-ot-epsilon', type=float, default=None,
+                        help='Single direct-OT regularization; omitted retains the historical .001/.01 mixture')
     parser.add_argument("--tau-list", type=float, nargs="+", default=[0.2, 0.05, 0.02])
     parser.add_argument("--normalize-per-temperature", action=argparse.BooleanOptionalAction,
                         default=True, help="Normalize each softmax field before summing")
@@ -241,6 +263,15 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         parser.error('Invalid optimizer, warmup, or gradient clipping settings')
     if not math.isfinite(args.sinkhorn_epsilon) or args.sinkhorn_epsilon <= 0 or args.sinkhorn_iters < 1:
         parser.error('Sinkhorn epsilon and iterations must be positive')
+    if not math.isfinite(args.sinkhorn_tolerance) or args.sinkhorn_tolerance < 0:
+        parser.error('Sinkhorn tolerance must be finite and nonnegative')
+    if args.sinkhorn_mode == 'ot' and args.objective != 'sinkhorn':
+        parser.error('--sinkhorn-mode ot requires --objective sinkhorn')
+    if args.sinkhorn_ot_epsilon is not None:
+        if not math.isfinite(args.sinkhorn_ot_epsilon) or args.sinkhorn_ot_epsilon <= 0:
+            parser.error('Direct OT epsilon must be finite and positive')
+        if args.objective != 'sinkhorn' or args.sinkhorn_mode != 'ot':
+            parser.error('--sinkhorn-ot-epsilon requires --objective sinkhorn --sinkhorn-mode ot')
     if (not math.isfinite(args.field_step) or args.field_step <= 0 or
             args.checkpoint_every < 0 or
             any(not math.isfinite(s) or s < 0 for s in args.noise_levels)):
@@ -479,6 +510,18 @@ def main(default_dataset: str = "cifar10") -> None:
                       sinkhorn_source_space="raw_pixel_views_no_encoder",
                       sinkhorn_marginal_diagnostic="max_absolute_plan_mass_error_per_view_then_mean_over_updates",
                       velocity_diagnostic="sinkhorn_raw_velocity_rms_in_scaled_pixel_space")
+        if args.sinkhorn_mode == 'ot':
+            config.update(sinkhorn_paper='https://arxiv.org/abs/2610.20331',
+                          sinkhorn_reference_code=None, sinkhorn_reference_code_sha256=None,
+                          sinkhorn_epsilon_mixture=({'0.001': .75, '0.01': .25}
+                              if args.sinkhorn_ot_epsilon is None else {f'{args.sinkhorn_ot_epsilon:g}': 1.}),
+                          sinkhorn_cost='0.5 * mean_squared_distance_in_batch_scaled_pixel_view',
+                          sinkhorn_regularization='epsilon_in_dimension_averaged_cost_units',
+                          sinkhorn_velocity_normalization='none',
+                          training_rule='direct_detached_plan_ot_attraction_minus_repulsion',
+                          target_update='none_direct_ot', target_regression_scaling='not_applicable',
+                          energy='detached_plan_ot_gradient_surrogate',
+                          velocity_diagnostic='negative_ot_gradient_times_query_count_in_scaled_dimension_normalized_coordinates')
     else:
         config["velocity_diagnostic"] = "ordinary_riesz_field_in_pixel_space"
     fid_evaluator = None
@@ -512,6 +555,8 @@ def main(default_dataset: str = "cifar10") -> None:
         loss_names = ('reconstruction_mse',)
     elif args.objective == 'sinkhorn':
         loss_names += ('sinkhorn_velocity_raw_rms', 'sinkhorn_marginal_max_error')
+        if args.sinkhorn_mode == 'ot':
+            loss_names += ('sinkhorn_ot_attraction', 'sinkhorn_ot_repulsion', 'sinkhorn_solver_iterations')
     start_iteration, elapsed_offset = 0, 0.0
     if restore_path is not None:
         if args.resume and not (args.output / 'config.json').exists():
@@ -544,7 +589,8 @@ def main(default_dataset: str = "cifar10") -> None:
                                warmup_steps=0, max_grad_norm=0.0, training_stage='distributional',
                                corruption_level=0.8, init_checkpoint=None, train_particles=None,
                                random_flip=False, lr_schedule='constant', min_learning_rate=0.0,
-                               schedule_start_update=0, no_field_rms_normalization=False)
+                               schedule_start_update=0, no_field_rms_normalization=False,
+                               sinkhorn_mode='wflow', sinkhorn_tolerance=1e-6)
         for key, value in vars(args).items():
             value = str(value) if isinstance(value, Path) else value
             if key == ('epochs' if unit == 'epoch' else 'steps'):
@@ -606,7 +652,8 @@ def main(default_dataset: str = "cifar10") -> None:
 
     diagnostic_totals, diagnostic_count = {}, 0
     diagnostic_path = args.output / 'training_diagnostics.csv'
-    if args.no_field_rms_normalization and diagnostic_path.exists():
+    record_training_diagnostics = args.no_field_rms_normalization or args.objective == 'sinkhorn'
+    if record_training_diagnostics and diagnostic_path.exists():
         with diagnostic_path.open(newline='') as previous:
             diagnostic_rows = list(csv.reader(previous))
         with diagnostic_path.open('w', newline='') as previous:
@@ -650,16 +697,18 @@ def main(default_dataset: str = "cifar10") -> None:
                 multiscale_options=multiscale_options, target_options=target_options,
                 sinkhorn_latent=sinkhorn_latent, sinkhorn_epsilon=args.sinkhorn_epsilon,
                 sinkhorn_iters=args.sinkhorn_iters, max_grad_norm=args.max_grad_norm,
-                no_field_rms_normalization=args.no_field_rms_normalization)
+                no_field_rms_normalization=args.no_field_rms_normalization,
+                sinkhorn_mode=args.sinkhorn_mode, sinkhorn_tolerance=args.sinkhorn_tolerance,
+                sinkhorn_ot_epsilon=args.sinkhorn_ot_epsilon)
             for name, value in step_diagnostics.items():
                 training_stats[name] = training_stats.get(name, 0) + float(value)
             training_updates += 1
             if ema_model is not None:
                 update_ema(model, ema_model, args.ema_decay)
             update_count += 1
-            if args.no_field_rms_normalization:
+            if record_training_diagnostics:
                 for name, value in step_diagnostics.items():
-                    if name.startswith('raw_') or name in ('grad_norm_before_clip', 'clip_fraction'):
+                    if name.startswith(('raw_', 'sinkhorn_')) or name in ('grad_norm_before_clip', 'clip_fraction', 'parameter_update_relative_norm'):
                         diagnostic_totals[name] = diagnostic_totals.get(name, 0.) + float(value)
                 diagnostic_count += 1
                 if (update_count % 100 == 0 or update_count == config['total_updates']
@@ -724,8 +773,13 @@ def main(default_dataset: str = "cifar10") -> None:
                     ref_latent = torch.randn((args.particles, args.latent_dim),
                                              generator=torch.Generator().manual_seed(args.seed + 6)).to(device)
                     reference = evaluation_images(evaluation_model, ref_latent)
-                    _, info = sinkhorn_target_loss(
-                        x, eval_train, reference, epsilon=args.sinkhorn_epsilon, iterations=args.sinkhorn_iters)
+                    if args.sinkhorn_mode == 'ot':
+                        _, info = sinkhorn_ot_loss(x, eval_train, reference,
+                            iterations=args.sinkhorn_iters, tolerance=args.sinkhorn_tolerance,
+                            epsilon=args.sinkhorn_ot_epsilon)
+                    else:
+                        _, info = sinkhorn_target_loss(
+                            x, eval_train, reference, epsilon=args.sinkhorn_epsilon, iterations=args.sinkhorn_iters)
                     speed = info['sinkhorn_velocity_raw_rms'].item()
                 else:
                     speed = velocity(x, eval_train, args.chunk_size).square().mean().sqrt().item()

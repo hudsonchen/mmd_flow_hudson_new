@@ -420,8 +420,89 @@ def sinkhorn_target_loss(features, target, reference, *, epsilon=0.05, iteration
         if not torch.isfinite(goal).all():
             raise RuntimeError('Nonfinite Sinkhorn regression target')
         info = dict(sinkhorn_velocity_raw_rms=velocity.square().mean().sqrt(),
-                    sinkhorn_marginal_max_error=torch.maximum(real_error, generated_error))
+                    sinkhorn_marginal_max_error=torch.maximum(real_error, generated_error),
+                    sinkhorn_solver_iterations=xs.new_tensor(iterations))
     return (features.float() / scale - goal).square().mean(), info
+
+
+@torch.no_grad()
+def sinkhorn_cost_plan(cost, *, epsilon, iterations=1000, tolerance=1e-6):
+    """Balanced log-domain Sinkhorn; tolerance=0 uses fixed iterations, no checks."""
+    if cost.ndim != 2 or min(cost.shape) < 1:
+        raise ValueError('Expected a nonempty cost matrix')
+    if (not math.isfinite(epsilon) or epsilon <= 0 or iterations < 1
+            or not math.isfinite(tolerance) or tolerance < 0):
+        raise ValueError('Invalid Sinkhorn solver settings')
+    # Row/column offsets leave a balanced coupling unchanged. Removing them
+    # reduces cancellation in float32 dual potentials at small epsilon.
+    centered = cost.detach() - cost.detach().amin(dim=1, keepdim=True)
+    centered = centered - centered.amin(dim=0, keepdim=True)
+    kernel = -centered / epsilon
+    log_a, log_b = -math.log(cost.shape[0]), -math.log(cost.shape[1])
+    v = cost.new_zeros(cost.shape[1])
+    for step in range(1, iterations + 1):
+        u = log_a - torch.logsumexp(kernel + v[None, :], dim=1)
+        v = log_b - torch.logsumexp(kernel + u[:, None], dim=0)
+        if tolerance and (step % 10 == 0 or step == iterations):
+            plan = (kernel + u[:, None] + v[None, :]).exp()
+            error = torch.maximum((plan.sum(1) - 1 / cost.shape[0]).abs().max(),
+                                  (plan.sum(0) - 1 / cost.shape[1]).abs().max())
+            if error.item() <= tolerance:
+                break
+    if not tolerance:
+        # Compute the final diagnostic only; never synchronize for convergence.
+        plan = (kernel + u[:, None] + v[None, :]).exp()
+        error = torch.maximum((plan.sum(1) - 1 / cost.shape[0]).abs().max(),
+                              (plan.sum(0) - 1 / cost.shape[1]).abs().max())
+    return plan, error, step
+
+
+def sinkhorn_ot_loss(features, target, reference, *, iterations=1000, tolerance=1e-6,
+                     epsilon=None):
+    """Direct detached-plan OT attraction minus independent generated repulsion.
+
+    Priming-inspired epsilon mixture (.001: .75, .01: .25). Our adaptation uses
+    batch-scaled pixel views and dimension-averaged quadratic costs, rather than
+    calibrated frozen encoder features. No field or gradient RMS normalization.
+    The scalar is a gradient surrogate, not the complete Sinkhorn divergence.
+    """
+    if reference is None:
+        raise ValueError('OT requires independent generated reference samples')
+    if epsilon is not None and (not math.isfinite(epsilon) or epsilon <= 0):
+        raise ValueError('Direct OT epsilon must be finite and positive')
+    regularizers = ((.001, .75), (.01, .25)) if epsilon is None else ((epsilon, 1.),)
+    with torch.no_grad():
+        x, y, ref = features.detach().float(), target.detach().float(), reference.detach().float()
+        dimension = x.shape[1]
+        distance = torch.cdist(x, torch.cat((x, ref, y)), compute_mode='donot_use_mm_for_euclid_dist')
+        scale = (distance.square().mean().sqrt() / math.sqrt(dimension)).clamp_min(1e-3)
+    z = features.float() / (scale * math.sqrt(dimension))
+    y, ref = y / (scale * math.sqrt(dimension)), ref / (scale * math.sqrt(dimension))
+    costs = [0.5 * torch.cdist(z, support, compute_mode='donot_use_mm_for_euclid_dist').square()
+             for support in (y, ref)]
+    terms, errors, counts, row_errors = [], [], [], []
+    velocity = torch.zeros_like(z.detach())
+    for cost, support, sign in zip(costs, (y, ref), (1., -1.)):
+        term = z.new_zeros(())
+        for regularization, weight in regularizers:
+            plan, error, count = sinkhorn_cost_plan(
+                cost, epsilon=regularization, iterations=iterations, tolerance=tolerance)
+            term = term + weight * (plan * cost).sum()
+            with torch.no_grad():
+                velocity.add_(sign * weight * (plan @ support - plan.sum(1, keepdim=True) * z.detach()))
+            errors.append(error)
+            counts.append(count)
+            row_errors.append((plan.sum(1) * len(z) - 1).abs().max())
+        terms.append(term)
+    value = terms[0] - terms[1]
+    if not torch.isfinite(value):
+        raise RuntimeError('Nonfinite direct OT loss')
+    return value, dict(sinkhorn_ot_attraction=terms[0].detach(),
+                       sinkhorn_ot_repulsion=terms[1].detach(),
+                       sinkhorn_velocity_raw_rms=(velocity * len(z)).square().mean().sqrt(),
+                       sinkhorn_marginal_max_error=torch.stack(errors).max(),
+                       sinkhorn_row_max_relative_error=torch.stack(row_errors).max(),
+                       sinkhorn_solver_iterations=z.new_tensor(max(counts)))
 
 
 # PyTorch adaptation of the official Drifting loss (MIT; DRIFTING_LICENSE.txt).

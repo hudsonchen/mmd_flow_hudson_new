@@ -2,17 +2,23 @@
 import math
 import torch
 from torch.nn import functional as F
-from loss import _riesz_topk_softmax_loss_impl, velocity, drifting_loss, sinkhorn_target_loss
+from loss import _riesz_topk_softmax_loss_impl, velocity, drifting_loss, sinkhorn_target_loss, sinkhorn_ot_loss
 
 
 def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
                         normalize_per_temperature, target_options=None,
                         reference=None, sinkhorn_epsilon=0.05, sinkhorn_iters=10,
-                        diagnostics=None, no_field_rms_normalization=False):
+                        diagnostics=None, no_field_rms_normalization=False,
+                        sinkhorn_mode="wflow", sinkhorn_tolerance=1e-6, sinkhorn_ot_epsilon=None):
     target = target.detach()
     if objective == 'sinkhorn':
-        value, info = sinkhorn_target_loss(
-            features, target, reference, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
+        if sinkhorn_mode == 'ot':
+            value, info = sinkhorn_ot_loss(features, target, reference,
+                                          iterations=sinkhorn_iters, tolerance=sinkhorn_tolerance,
+                                          epsilon=sinkhorn_ot_epsilon)
+        else:
+            value, info = sinkhorn_target_loss(
+                features, target, reference, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
         if diagnostics is not None:
             for name, result in info.items():
                 diagnostics.setdefault(name, []).append(result)
@@ -57,7 +63,8 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                     global_weight=1.0, coarse_weight=1.0, patch_weight=1.0,
                     target_options=None, reference_images=None,
                     sinkhorn_epsilon=0.05, sinkhorn_iters=10,
-                    no_field_rms_normalization=False):
+                    no_field_rms_normalization=False, sinkhorn_mode="wflow", sinkhorn_tolerance=1e-6,
+                    sinkhorn_ot_epsilon=None):
     """Return a weighted loss and detached group diagnostics.
 
     Crop coordinates are shared across generated/real populations, without
@@ -88,7 +95,9 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                                    reference=ref.flatten(1) if ref is not None else None,
                                    sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
                                    diagnostics=diagnostics,
-                                   no_field_rms_normalization=no_field_rms_normalization)
+                                   no_field_rms_normalization=no_field_rms_normalization,
+                                   sinkhorn_mode=sinkhorn_mode, sinkhorn_tolerance=sinkhorn_tolerance,
+                                   sinkhorn_ot_epsilon=sinkhorn_ot_epsilon)
 
     groups = {}
     if global_weight:
@@ -114,5 +123,5 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                 zip(('global', 'coarse', 'patch'), weights) if weight) / sum(weights)
     return total, {**{name: value.detach() for name, value in groups.items()},
                    'combined': total.detach(),
-                   **{name: torch.stack(values).max() if name == 'sinkhorn_marginal_max_error'
+                   **{name: torch.stack(values).max() if name in ('sinkhorn_marginal_max_error', 'sinkhorn_row_max_relative_error')
                       else torch.stack(values).mean() for name, values in diagnostics.items()}}

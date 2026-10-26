@@ -40,6 +40,41 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def preserve_best_fid(record):
+    """Keep one immutable recovery checkpoint matching the best completed FID."""
+    if not record.get('preserve_best_fid'):
+        return
+    output = Path(record['output'])
+    metrics = output / 'fid_metrics.json'
+    if not metrics.exists():
+        return
+    rows = json.loads(metrics.read_text())
+    if not rows:
+        return
+    latest = rows[-1]
+    archive = output / 'checkpoints' / 'best_fid'
+    provenance = archive / 'metrics.json'
+    if provenance.exists() and json.loads(provenance.read_text())['fid'] <= latest['fid']:
+        return
+    checkpoint = output / 'checkpoint_latest.pt'
+    if not checkpoint.exists():
+        return
+    archive.mkdir(parents=True, exist_ok=True)
+    candidate = archive / 'candidate.pt'
+    try:
+        os.link(checkpoint, candidate)
+        import torch
+        saved = torch.load(candidate, map_location='cpu', mmap=True, weights_only=False)
+        update = saved['update_count']
+        del saved
+        if update != latest['iteration']:
+            return  # FID is written before the corresponding checkpoint.
+        candidate.replace(archive / 'checkpoint_latest.pt')
+        write_json(provenance, dict(latest, checkpoint=str(archive / 'checkpoint_latest.pt')))
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, required=True)
@@ -57,6 +92,8 @@ def main():
     env = dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2',
                MKL_NUM_THREADS='2', PYTHONUNBUFFERED='1', DRIFT_COMPILE='0')
     locks, streams, children = [], [], []
+    refresh = None
+    refresh_signature = None
 
     def status(record, state, code=0, **extra):
         path = Path(record['output']) / 'job_status.json'
@@ -105,6 +142,18 @@ def main():
         remaining = set(range(len(children)))
         failed = False
         while remaining:
+            for record in records:
+                try:
+                    preserve_best_fid(record)
+                except Exception as error:
+                    print(f'Best-FID retention pending: {error}', flush=True)
+            if manifest.get('refresh_command'):
+                signature = tuple((Path(r['output']) / 'fid_metrics.json').stat().st_mtime_ns
+                                  if (Path(r['output']) / 'fid_metrics.json').exists() else 0
+                                  for r in records)
+                if any(signature) and signature != refresh_signature and (refresh is None or refresh.poll() is not None):
+                    refresh_signature = signature
+                    refresh = subprocess.Popen(manifest['refresh_command'], env=env)
             for index in list(remaining):
                 code = children[index].poll()
                 if code is None:
@@ -134,6 +183,8 @@ def main():
             status(record, 'worker_failed', 1)
         raise
     finally:
+        if refresh is not None:
+            refresh.wait(timeout=300)
         for stream in streams + locks:
             stream.close()
 

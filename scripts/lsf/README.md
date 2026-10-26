@@ -214,3 +214,77 @@ four to two. Diffusion was stopped by user request with a durable update-192,000
 checkpoint preserved in its `training/checkpoints/paused_20261026T000911Z/`
 directory; its dependent finalizer was cancelled. GPU sharing changes throughput,
 so wall-clock comparisons should account for this scheduling change.
+
+Standard Riesz was subsequently paused at update 9,000. Its place alongside
+softmax LR 5e-4 is used by the primed Sinkhorn OT experiment in
+`results/cifar/priming_sinkhorn_ot_lr2e4_seed42_20261026/`. The other pair continues.
+
+## Direct Sinkhorn OT comparison
+
+`run_tuned_cifar.py --objective sinkhorn --sinkhorn-mode ot --sinkhorn-iters 10
+--sinkhorn-tolerance 0 --learning-rate 0.0002 --min-learning-rate 0.0001
+--restart-from-priming CHECKPOINT` selects direct OT post-training from the same
+reconstruction checkpoint. The existing default `--sinkhorn-mode wflow` retains
+the normalized barycentric-target regression objective.
+
+The new mode uses detached balanced transport plans: attraction to real samples
+minus repulsion from an independent generated batch. It combines regularization
+strengths 0.001 and 0.01 with weights 0.75 and 0.25, inspired by the Priming paper
+(https://arxiv.org/abs/2610.20331). This is a pixel-space adaptation: it retains
+our batch-distance scaling and multiscale pixel views, with dimension-averaged
+quadratic costs, rather than the paper's calibrated frozen encoder features.
+There is no field RMS normalization. The scalar is a gradient surrogate, not
+the complete entropy-regularized Sinkhorn divergence. The original run switched to exactly
+ten inner iterations with convergence checks disabled
+(`--sinkhorn-tolerance 0`) after update 1,000. The original first 1,000 updates
+used convergence checks every ten iterations, capped at 1,000. The original
+checkpoint and source are preserved; the continuation retains model, EMA,
+optimizer, and RNG state. A final marginal-error diagnostic is still recorded.
+Metrics record attraction, repulsion, raw velocity RMS, marginal error, and solver
+iteration counts.
+
+The comparison retains seed 42, generated/real batches 128/256, view weights
+2:1:1, four crops per size, Adam, clipping at norm 1, EMA 0.9999, and 1,000-step
+warmup followed by cosine decay from 2e-4 to 1e-4 over 250,000 updates. FID and
+held-out Riesz MMD use the existing evaluation protocol. Each run has a frozen
+source snapshot and a deployment manifest containing its exact command.
+
+## Smaller-batch GPU benchmark
+
+`benchmark_cifar_batch.py --source SOURCE --data-root DATA --checkpoint PRIMING
+--output RESULTS` tests generated batches of 64 and 96 for normalized softmax
+and Sinkhorn OT, plus batch 64 for softmax without field RMS normalization.
+If batch 64 runs out of memory, it tries 32 instead of 96. Each case uses a fresh
+process, the reconstruction weights, 256 real images, the production multiscale
+views, Adam and EMA. The full real dataset and FID network remain on the GPU.
+Two warmup updates precede eight timed updates, followed by an evaluation batch
+of 64 with optimizer state and gradients still resident. Results include timing,
+peak allocated/reserved memory, finite-output checks, and any out-of-memory error.
+These are short capacity/speed checks, not FID or training-quality comparisons.
+Reducing the generated batch changes the empirical particle interaction loss;
+ordinary gradient accumulation does not reproduce the original larger-batch loss.
+
+## Conservative Sinkhorn pair
+
+`results/cifar/sinkhorn_pair_stable_20261026/manifest.json` deploys two independent
+trainers on one H200: `priming_sinkhorn_ot_stable_seed42_20261026` and
+`priming_sinkhorn_wflow_stable_seed42_20261026`. Both restart from the same
+80-epoch reconstruction checkpoint, with fresh Adam and random streams, peak
+LR 5e-5, cosine floor 2.5e-5, 5,000-step warmup, seed 42, EMA 0.9999, and the
+existing 128/256 generated/real batches and multiscale 2:1:1 view weights.
+Both use exactly ten inner iterations with convergence checks disabled.
+
+Direct OT selects `--sinkhorn-ot-epsilon 0.05`; omitting that option preserves
+the historical 0.001/0.01 mixture. W-Flow uses the existing barycentric,
+RMS-normalized fixed-point target loss with `--sinkhorn-epsilon 0.05`.
+The no-RMS softmax Riesz run remains on its separate H200. The preceding
+Sinkhorn run was stopped with a resumable update-12,000 checkpoint preserved.
+
+Both new runs log 100-update averages of pre-clip gradient norms, clipping
+frequency, relative parameter-update norms, and transport diagnostics. FID-10K
+and recovery checkpoints occur every 1,000 updates; numbered checkpoints remain
+every 25,000 updates. The pair worker retains the checkpoint corresponding to
+the best completed FID under `checkpoints/best_fid/` and refreshes the comparison
+notebook when new FID scores arrive. Separate outputs, checkpoints, and RNG
+states are maintained for each trainer. The pair manifest records both exact
+commands, and each study retains a frozen source snapshot with hashes.
