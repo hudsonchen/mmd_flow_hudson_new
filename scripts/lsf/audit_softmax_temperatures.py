@@ -24,6 +24,10 @@ def main():
     parser.add_argument('--batches', type=int, default=3)
     parser.add_argument('--chunk', type=int, default=16)
     parser.add_argument('--parameter-gradients', action='store_true')
+    parser.add_argument('--checkpoint', type=Path,
+                        help='Audit a historical checkpoint instead of the latest recovery checkpoint')
+    parser.add_argument('--capture-field-outliers', action='store_true',
+                        help='Preserve views whose raw field exceeds its unit-direction magnitude bound')
     args = parser.parse_args()
     os.environ['DRIFT_COMPILE'] = '0'
     source = args.run.parent / 'source'
@@ -38,7 +42,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     preserved = args.output / 'checkpoint.pt'
     if not preserved.exists():
-        os.link(args.run / 'checkpoint_latest.pt', preserved)
+        os.link(args.checkpoint or args.run / 'checkpoint_latest.pt', preserved)
     saved = torch.load(preserved, map_location='cpu', weights_only=False, mmap=True)
     config = saved['arguments']
     taus = config['tau_list']
@@ -114,7 +118,7 @@ def main():
         full_loss=0.
         view_rows=[]
         for name,a,b,weight in views:
-            vectors=[]; row=dict(view=name,weight=weight,temperatures=[])
+            vectors=[]; row=dict(view=name,weight=weight,dimension=a[0].numel(),temperatures=[])
             for i,tau in enumerate(taus):
                 loss,info=loss_fn(a.flatten(1).unsqueeze(0),b.flatten(1).unsqueeze(0),**kwargs([tau]))
                 tau_losses[i]=tau_losses[i]+weight*loss.mean()
@@ -124,6 +128,14 @@ def main():
                     applied_rms=rms(velocity),positive_ess=float(info[prefix+'positive_ess']),
                     generated_ess=float(info[prefix+'generated_ess']),
                     target_displacement_rms=rms(velocity*info['scale_inputs'])))
+                bound = 2 / (tau * a[0].numel()**.5)
+                row['temperatures'][-1]['unit_direction_rms_bound'] = bound
+                if args.capture_field_outliers and float(info[prefix+f'force_rms_tau_{tau:g}']) > bound * 1.01:
+                    destination = args.output / f'outlier_batch{batch}_{name}_tau{tau:g}.pt'
+                    torch.save(dict(features=a.detach().cpu(), target=b.detach().cpu(), tau=tau,
+                                    scale_inputs=info['scale_inputs'].cpu(),
+                                    measured_raw_rms=info[prefix+f'force_rms_tau_{tau:g}'].cpu()), destination)
+                    row['temperatures'][-1]['outlier_file'] = str(destination)
             loss,info=loss_fn(a.flatten(1).unsqueeze(0),b.flatten(1).unsqueeze(0),**kwargs(taus))
             full_loss=full_loss+weight*loss.mean()
             row.update(describe(vectors)); row['combined_field_rms']=rms(info['frozen_velocity'])

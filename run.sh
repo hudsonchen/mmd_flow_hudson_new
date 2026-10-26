@@ -58,6 +58,7 @@ OUTPUT="${OUTPUT:-${SCRIPT_DIR}/results/${RESULT_GROUP}/${RUN_NAME}_$(date +%Y%m
 if [[ ! -x "$PYTHON" ]]; then
     printf 'Python environment not found: %s\n' "$PYTHON" >&2; exit 1
 fi
+OUTPUT="$("$PYTHON" "$SCRIPT_DIR/run_storage.py" "$OUTPUT")"
 "$PYTHON" -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"; print("GPU:", torch.cuda.get_device_name(0))'
 if [[ -e "$OUTPUT/config.json" ]]; then
     printf 'Existing run: %s; choose a fresh OUTPUT.\n' "$OUTPUT" >&2; exit 1

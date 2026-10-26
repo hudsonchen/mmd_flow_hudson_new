@@ -54,6 +54,20 @@ for _ in range(2):
     assert all(torch.isfinite(value) for value in diagnostics.values())
 assert all(torch.isfinite(p).all() for p in model.parameters())
 torch.cuda.synchronize()
+seconds_per_update = (time.monotonic() - started) / 2
+numerical_regression = None
+if objective == 'softmax-riesz':
+    from loss import _softmax_toward
+    source = .5 + torch.randn(1, 128, 147, device='cuda') * 1e-4
+    support = .5 + torch.randn(1, 256, 147, device='cuda') * 1e-4
+    field, _ = _softmax_toward(source, support, torch.ones(1, 256, device='cuda'),
+                              .02 * 147**.5, 1e-8)
+    maximum = float(field.norm(dim=-1).max())
+    assert maximum <= 1.00001, maximum
+    numerical_regression = dict(near_collision_max_unit_average_norm=maximum, bound=1.)
+    if no_field_rms_normalization:
+        for tau in (.2, .05, .02):
+            assert float(diagnostics[f'raw_force_rms_tau_{tau:g}']) <= 2 / (tau * 147**.5) * 1.00001
 result = dict(status='passed', training_generated_batch=128, real_batch=256,
               learning_rate=learning_rate, objective=objective,
               field_rms_normalization=('none' if no_field_rms_normalization or
@@ -66,6 +80,6 @@ result = dict(status='passed', training_generated_batch=128, real_batch=256,
               diagnostics={key: float(value) for key, value in diagnostics.items()},
               crops_per_size=4, gpu=torch.cuda.get_device_name(),
               peak_gib=torch.cuda.max_memory_allocated() / 2**30,
-              seconds_per_update=(time.monotonic() - started) / 2)
+              seconds_per_update=seconds_per_update, numerical_regression=numerical_regression)
 Path(sys.argv[1]).write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result), flush=True)

@@ -14,6 +14,7 @@ import time
 import torch
 
 from backbone import build_backbone, backbone_metadata
+from run_storage import new_run_path
 from data import (FILES, CIFAR10_ARCHIVES, CIFAR10_CLASSES, download_mnist,
                   download_cifar10, load_dataset, image_shape as dataset_image_shape)
 from loss import (backpropagate_objective, mean_distance, mmd_squared, velocity,
@@ -195,7 +196,11 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
                         help="Clip parameter gradient norm; 0 disables")
     parser.add_argument("--ema-decay", type=float, default=None,
                         help="EMA decay per optimizer update; default 0.999 for CIFAR, 0 for MNIST; 0 disables")
-    parser.add_argument("--architecture", choices=("unet", "mlp"), default="unet")
+    parser.add_argument("--architecture", choices=("unet", "mlp", "dit"), default="unet")
+    parser.add_argument('--dit-width', type=int, default=384)
+    parser.add_argument('--dit-depth', type=int, default=12)
+    parser.add_argument('--dit-heads', type=int, default=6)
+    parser.add_argument('--dit-patch-size', type=int, default=2)
     parser.add_argument("--base-channels", type=int, default=None)
     parser.add_argument("--num-res-blocks", type=int, default=4, help="Residual blocks per CIFAR U-Net stage")
     parser.add_argument("--latent-dim", type=int, default=None,
@@ -241,6 +246,10 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
                         default="distributional")
     parser.add_argument("--corruption-level", type=float, default=0.8,
                         help="Fixed reconstruction corruption: (1-s)*(2*image-1) + s*noise")
+    parser.add_argument('--lpips-weight', type=float, default=0.0,
+                        help='Frozen VGG LPIPS weight for CIFAR reconstruction only')
+    parser.add_argument('--lpips-cache', type=Path, default=None,
+                        help='Explicit pretrained-weight cache for perceptual priming')
     parser.add_argument("--init-checkpoint", type=Path, default=None,
                         help="Start a new distributional run from online weights and inherited EMA; fresh optimizer")
     parser.add_argument("--save-every", type=int, default=200)
@@ -298,10 +307,18 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     image_dim = 784 if args.dataset == "mnist" else 3072
     if not math.isfinite(args.corruption_level) or not 0 <= args.corruption_level <= 1:
         parser.error('--corruption-level must be finite and in [0, 1]')
+    if not math.isfinite(args.lpips_weight) or args.lpips_weight < 0:
+        parser.error('--lpips-weight must be finite and nonnegative')
+    if args.lpips_weight and (args.training_stage != 'reconstruction' or args.dataset != 'cifar10'):
+        parser.error('LPIPS is only supported for CIFAR reconstruction pretraining')
+    if args.lpips_weight and args.lpips_cache is None:
+        parser.error('--lpips-cache is required with positive --lpips-weight')
     if args.init_checkpoint and args.training_stage != 'distributional':
         parser.error('--init-checkpoint is for distributional post-training')
     if args.output is None:
         args.output = Path("results") / ("mnist" if args.dataset == "mnist" else "cifar") / f"{args.dataset}_riesz_p1"
+    if not args.resume:
+        args.output = new_run_path(args.output)
     if args.base_channels is None:
         args.base_channels = 32 if args.dataset == "mnist" else 128
     if args.digit is not None:
@@ -311,9 +328,15 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
             parser.error("use only one of --digit and --class-id")
         args.class_id = args.digit
     if args.latent_dim is None:
-        args.latent_dim = image_dim if args.architecture == "unet" else 32
-    if args.architecture == "unet" and args.latent_dim != image_dim:
-        parser.error(f"the {args.dataset} U-Net requires --latent-dim {image_dim}")
+        args.latent_dim = image_dim if args.architecture in ('unet', 'dit') else 32
+    if args.architecture in ('unet', 'dit') and args.latent_dim != image_dim:
+        parser.error(f"the {args.dataset} {args.architecture} requires --latent-dim {image_dim}")
+    if args.architecture == 'dit':
+        if args.dataset != 'cifar10':
+            parser.error('DiT currently supports CIFAR-10 only')
+        if (min(args.dit_width, args.dit_depth, args.dit_heads, args.dit_patch_size) <= 0
+                or args.dit_width % args.dit_heads or args.dit_width % 4 or 32 % args.dit_patch_size):
+            parser.error('DiT needs positive sizes, width divisible by heads and 4, and patch size dividing 32')
     if args.training_stage == 'reconstruction' and args.latent_dim != image_dim:
         parser.error('Reconstruction requires image-dimensional inputs')
     if args.training_stage == 'reconstruction' and (args.multiscale_loss or args.noise_levels != [0.0]):
@@ -391,8 +414,9 @@ def main(default_dataset: str = "cifar10") -> None:
             crops_per_size=args.crops_per_size, patch_rng=torch.Generator().manual_seed(args.seed + 2),
             global_weight=args.global_loss_weight, coarse_weight=args.coarse_loss_weight,
             patch_weight=args.patch_loss_weight)
+    dit_options = {key: getattr(args, key) for key in ('dit_width', 'dit_depth', 'dit_heads', 'dit_patch_size')}
     model = build_backbone(args.dataset, args.architecture, args.latent_dim, args.base_channels,
-                           args.hidden_dims, args.num_res_blocks).to(device)
+                           args.hidden_dims, args.num_res_blocks, **dit_options).to(device)
     optimizer = getattr(torch.optim, args.optimizer)(
         model.parameters(), lr=args.learning_rate, betas=(0.9, args.adam_beta2),
         weight_decay=args.weight_decay)
@@ -401,6 +425,10 @@ def main(default_dataset: str = "cifar10") -> None:
     if args.init_checkpoint and restore_path is None:
         initialization = initialize_from_checkpoint(model, ema_model, args.init_checkpoint, args)
     evaluation_model = ema_model if ema_model is not None else model
+    perceptual_loss = None
+    if args.lpips_weight:
+        from perceptual import VGGPerceptualLoss
+        perceptual_loss = VGGPerceptualLoss(args.lpips_cache, device)
     x = evaluation_images(evaluation_model, eval_latent)
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / "config.json").exists() and args.resume is None:
@@ -419,14 +447,15 @@ def main(default_dataset: str = "cifar10") -> None:
                   actual_target_size=len(target), actual_eval_size=len(heldout),
                   torch_version=str(torch.__version__),
                   initialization="ddpm_fan_average_uniform_near_zero_output_branches"
-                  if args.dataset == "cifar10" and args.architecture == "unet" else "pytorch_default",
+                  if args.dataset == "cifar10" and args.architecture == "unet" else
+                  'xavier_linear_zero_residual_gates_pixel_head_std_1e-3' if args.architecture == 'dit' else 'pytorch_default',
                   parameterization="neural_generator", latent_distribution="standard_normal",
                   training_latent_sampling="resample_every_update",
                   training_latent_seed=args.seed + 1,
                   evaluation_latent_sampling="fixed_independent_standard_normal",
                   architecture=backbone_metadata(args.dataset, args.architecture, args.latent_dim,
-                                                 args.base_channels, args.hidden_dims, args.num_res_blocks),
-                  hidden_activation="SiLU", output_activation="Sigmoid",
+                                                 args.base_channels, args.hidden_dims, args.num_res_blocks, **dit_options),
+                  hidden_activation='GELU' if args.architecture == 'dit' else 'SiLU', output_activation="Sigmoid",
                   parameter_count=sum(p.numel() for p in model.parameters()),
                   training_rule="detached_scaled_velocity_regression" if args.objective in ("softmax-riesz", "sinkhorn", "drifting")
                   else "exact_half_mmd_gradient",
@@ -460,6 +489,11 @@ def main(default_dataset: str = "cifar10") -> None:
                       reconstruction_adaptation='plain MSE; no perceptual loss; no class conditioning',
                       reconstruction_eval_seed=args.seed + 7,
                       training_latent_sampling='one_independent_noise_image_per_real_target')
+        if perceptual_loss is not None:
+            config.update(training_rule='paired_denoising_mse_plus_lpips',
+                          energy='mean_pixel_squared_error_plus_weighted_lpips',
+                          reconstruction_adaptation='MSE plus frozen VGG LPIPS; no class conditioning',
+                          reconstruction_perceptual={**perceptual_loss.metadata, 'weight': args.lpips_weight})
     if args.multiscale_loss:
         config.update(training_view_geometry="full_image_and_average_pooled_images_and_aligned_crops",
                       patch_sampling_seed=args.seed + 2,
@@ -475,6 +509,7 @@ def main(default_dataset: str = "cifar10") -> None:
                       softmax_module_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
                       softmax_epsilon=1e-6, softmax_direction_epsilon=1e-8,
                       softmax_rms_epsilon=1e-8, softmax_feature_space="raw_pixels",
+                      softmax_numerics='direct_pairwise_differences', softmax_query_chunk=32,
                       softmax_fixed_negatives=False,
                       softmax_field_normalization=('none' if args.no_field_rms_normalization else
                                                    'per_temperature' if args.normalize_per_temperature else 'combined'),
@@ -553,6 +588,8 @@ def main(default_dataset: str = "cifar10") -> None:
     loss_names = ('global', 'coarse', 'patch', 'combined') if args.multiscale_loss else ()
     if args.training_stage == 'reconstruction':
         loss_names = ('reconstruction_mse',)
+        if perceptual_loss is not None:
+            loss_names += ('reconstruction_lpips', 'reconstruction_total')
     elif args.objective == 'sinkhorn':
         loss_names += ('sinkhorn_velocity_raw_rms', 'sinkhorn_marginal_max_error')
         if args.sinkhorn_mode == 'ot':
@@ -562,9 +599,14 @@ def main(default_dataset: str = "cifar10") -> None:
         if args.resume and not (args.output / 'config.json').exists():
             raise ValueError('Resume requires the original output directory and config.json')
         checkpoint = torch.load(restore_path, map_location='cpu', weights_only=False)
+        if perceptual_loss is not None:
+            previous_perceptual = checkpoint['config'].get('reconstruction_perceptual', {})
+            if previous_perceptual.get('weights_sha256') != perceptual_loss.metadata['weights_sha256']:
+                raise ValueError('Resume perceptual weights mismatch')
         if 'priming_initialization' in checkpoint['config']:
             config['priming_initialization'] = checkpoint['config']['priming_initialization']
-        ignored = {'resume', 'fork_checkpoint', 'threads', 'device', 'checkpoint_every', 'keep_checkpoint_every'}
+        ignored = {'resume', 'fork_checkpoint', 'threads', 'device', 'checkpoint_every', 'keep_checkpoint_every',
+                   'save_every'}  # Evaluation cadence does not change training or optimizer state.
         tuning_keys = {'output', 'learning_rate', 'lr_schedule', 'min_learning_rate',
                        'schedule_start_update', 'warmup_steps', 'train_particles', 'random_flip',
                        'max_grad_norm', 'ema_decay', 'crops_per_size', 'global_loss_weight',
@@ -590,7 +632,9 @@ def main(default_dataset: str = "cifar10") -> None:
                                corruption_level=0.8, init_checkpoint=None, train_particles=None,
                                random_flip=False, lr_schedule='constant', min_learning_rate=0.0,
                                schedule_start_update=0, no_field_rms_normalization=False,
-                               sinkhorn_mode='wflow', sinkhorn_tolerance=1e-6)
+                               sinkhorn_mode='wflow', sinkhorn_tolerance=1e-6,
+                               dit_width=384, dit_depth=12, dit_heads=6, dit_patch_size=2,
+                               lpips_weight=0.0, lpips_cache=None)
         for key, value in vars(args).items():
             value = str(value) if isinstance(value, Path) else value
             if key == ('epochs' if unit == 'epoch' else 'steps'):
@@ -679,8 +723,10 @@ def main(default_dataset: str = "cifar10") -> None:
             if args.training_stage == 'reconstruction':
                 noise = torch.randn(batch.shape, generator=train_latent_rng).to(device)
                 step_diagnostics = reconstruction_step(
-                    model, batch, noise, optimizer, args.corruption_level, args.max_grad_norm)
-                training_stats['reconstruction_mse'] = training_stats.get('reconstruction_mse', 0) + step_diagnostics['reconstruction_mse']
+                    model, batch, noise, optimizer, args.corruption_level, args.max_grad_norm,
+                    perceptual_loss=perceptual_loss, perceptual_weight=args.lpips_weight)
+                for name, value in step_diagnostics.items():
+                    training_stats[name] = training_stats.get(name, 0) + value
                 training_updates += 1
                 if ema_model is not None:
                     update_ema(model, ema_model, args.ema_decay)
@@ -738,7 +784,7 @@ def main(default_dataset: str = "cifar10") -> None:
                             + (["fid"] if fid_evaluator is not None else [])
                             + (["heldout_reconstruction_mse"] if args.training_stage == 'reconstruction' else [])
                             + [name if name.startswith('sinkhorn_') else
-                               ('train_reconstruction_mse' if name == 'reconstruction_mse' else f'train_{name}_surrogate')
+                               (f'train_{name}' if name.startswith('reconstruction_') else f'train_{name}_surrogate')
                                for name in loss_names])
         for iteration in range(start_iteration, total_iterations + 1):
             if iteration > 0:

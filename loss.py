@@ -39,7 +39,12 @@ def _softmax_toward(
     *,
     exclude_self: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return the softmax-weighted unit directions toward ``target`` and ESS."""
+    """Return weighted unit directions using direct differences, bounded in memory.
+
+    Avoid squared-norm distance identities and subtracting large weighted sums:
+    both lose precision for coincident or nearly coincident pixel features.
+    Chunk queries while keeping the complete support in each row's softmax.
+    """
     if target.shape[1] == 0:
         empty_ess = source.new_zeros(source.shape[:2])
         return torch.zeros_like(source), empty_ess
@@ -51,29 +56,23 @@ def _softmax_toward(
         empty_ess = source.new_zeros(source.shape[:2])
         return torch.zeros_like(source), empty_ess
 
-    distance = torch.cdist(source, target)
-    logits = -distance / tau
-    if exclude_self:
-        diagonal = torch.eye(
-            source.shape[1], device=source.device, dtype=torch.bool
-        ).unsqueeze(0)
-        logits = logits.masked_fill(diagonal, float("-inf"))
-
-    softmax_weight = torch.softmax(logits, dim=-1)
-    coefficient = (
-        softmax_weight
-        * target_weight[:, None, :]
-        / distance.clamp_min(float(direction_epsilon))
-    )
-    if exclude_self:
-        coefficient = coefficient.masked_fill(diagonal, 0.0)
-
-    # This is algebraically sum_j a_ij (target_j - source_i) / distance_ij,
-    # but avoids materializing a [B, source, target, D] direction tensor.
-    toward = torch.bmm(coefficient, target)
-    toward.sub_(source * coefficient.sum(dim=-1, keepdim=True))
-    ess = 1.0 / torch.sum(softmax_weight * softmax_weight, dim=-1).clamp_min(1e-30)
-    return toward, ess
+    toward_chunks, ess_chunks = [], []
+    support_indices = torch.arange(target.shape[1], device=source.device)
+    for start in range(0, source.shape[1], 32):
+        query = source[:, start:start + 32]
+        delta = target[:, None, :, :] - query[:, :, None, :]
+        distance = torch.linalg.vector_norm(delta, dim=-1)
+        logits = -distance / tau
+        if exclude_self:
+            query_indices = torch.arange(start, start + query.shape[1], device=source.device)
+            diagonal = (query_indices[:, None] == support_indices[None, :]).unsqueeze(0)
+            logits = logits.masked_fill(diagonal, float('-inf'))
+        softmax_weight = torch.softmax(logits, dim=-1)
+        coefficient = (softmax_weight * target_weight[:, None, :]
+                       / distance.clamp_min(float(direction_epsilon)))
+        toward_chunks.append((delta * coefficient[..., None]).sum(dim=2))
+        ess_chunks.append(1.0 / softmax_weight.square().sum(dim=-1).clamp_min(1e-30))
+    return torch.cat(toward_chunks, dim=1), torch.cat(ess_chunks, dim=1)
 
 
 def _riesz_topk_softmax_loss_impl(
@@ -161,7 +160,7 @@ def _riesz_topk_softmax_loss_impl(
         old_gen = gen.detach()
         scale_targets = torch.cat([old_gen, fixed_neg, fixed_pos], dim=1)
         scale_weights = torch.cat([weight_gen, weight_neg, weight_pos], dim=1)
-        scale_distance = torch.cdist(old_gen, scale_targets)
+        scale_distance = torch.cdist(old_gen, scale_targets, compute_mode='donot_use_mm_for_euclid_dist')
         scale = (
             (scale_distance * scale_weights[:, None, :]).mean()
             / (scale_weights.mean() + float(epsilon))

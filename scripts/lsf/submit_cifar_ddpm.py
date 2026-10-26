@@ -8,6 +8,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from run_storage import new_run_path
 
 
 def main():
@@ -19,11 +23,11 @@ def main():
     if args.steps < 1:
         parser.error('--steps must be positive')
     repo = Path(__file__).resolve().parents[2]
-    study = args.study.resolve()
+    study = new_run_path(args.study).resolve()
     study.mkdir(parents=True, exist_ok=False)
     source = study / 'source'
     source.mkdir()
-    for name in ('ddpm.py', 'backbone.py', 'data.py', 'fid.py', '_fid_inception.py', 'visualization.py'):
+    for name in ('ddpm.py', 'backbone.py', 'data.py', 'fid.py', '_fid_inception.py', 'visualization.py', 'run_storage.py'):
         shutil.copy2(repo / name, source / name)
     shutil.copytree(repo / 'scripts/lsf', source / 'scripts/lsf', ignore=shutil.ignore_patterns('__pycache__'))
     (source / 'tests').mkdir()

@@ -6,27 +6,39 @@ Eq. (1). No upstream implementation is copied. The generator retains its
 """
 from pathlib import Path
 import hashlib
+import math
 import torch
 
 
 def reconstruction_step(model, clean, noise, optimizer, corruption_level=0.8,
-                        max_grad_norm=0.0):
+                        max_grad_norm=0.0, *, perceptual_loss=None, perceptual_weight=0.0):
     """One paired denoising update; no distributional field or timestep input."""
     if clean.shape != noise.shape:
         raise ValueError('Reconstruction noise and clean images must have matching shapes')
     if not 0 <= corruption_level <= 1:
         raise ValueError('corruption_level must be in [0, 1]')
+    if not math.isfinite(perceptual_weight) or perceptual_weight < 0:
+        raise ValueError('Perceptual weight must be finite and nonnegative')
+    if perceptual_weight and perceptual_loss is None:
+        raise ValueError('Positive perceptual weight requires a perceptual loss')
     optimizer.zero_grad(set_to_none=True)
     corrupted = (1 - corruption_level) * (2 * clean - 1) + corruption_level * noise
     prediction = model(corrupted)
-    loss = torch.nn.functional.mse_loss(prediction, clean)
+    mse = torch.nn.functional.mse_loss(prediction, clean)
+    loss = mse
+    diagnostics = {'reconstruction_mse': mse.detach().item()}
+    if perceptual_weight:
+        perceptual = perceptual_loss(prediction, clean)
+        loss = mse + perceptual_weight * perceptual
+        diagnostics.update(reconstruction_lpips=perceptual.detach().item(),
+                           reconstruction_total=loss.detach().item())
     if not torch.isfinite(loss):
         raise RuntimeError('Nonfinite reconstruction loss')
     loss.backward()
     if max_grad_norm:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, error_if_nonfinite=True)
     optimizer.step()
-    return {'reconstruction_mse': loss.detach().item()}
+    return diagnostics
 
 
 def initialize_from_checkpoint(model, ema_model, path, args):
@@ -40,6 +52,10 @@ def initialize_from_checkpoint(model, ema_model, path, args):
                 'hidden_dims', 'class_id'):
         if source.get(key) != getattr(args, key):
             raise ValueError(f'Priming checkpoint mismatch for {key}')
+    if args.architecture == 'dit':
+        for key in ('dit_width', 'dit_depth', 'dit_heads', 'dit_patch_size'):
+            if source.get(key) != getattr(args, key):
+                raise ValueError(f'Priming checkpoint mismatch for {key}')
     duration = source['epochs'] if source['epochs'] is not None else source['steps']
     if checkpoint['iteration'] != duration:
         raise ValueError('Priming initialization requires a completed reconstruction stage')
@@ -51,6 +67,7 @@ def initialize_from_checkpoint(model, ema_model, path, args):
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     return dict(checkpoint=str(path.resolve()), sha256=digest,
                 source_updates=checkpoint['update_count'], source_iteration=checkpoint['iteration'],
+                source_perceptual=checkpoint.get('config', {}).get('reconstruction_perceptual'),
                 online_weights=True, inherited_ema=checkpoint.get('ema_model') is not None,
                 optimizer='fresh', random_streams='fresh_post_training_seed')
 

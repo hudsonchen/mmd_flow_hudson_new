@@ -34,6 +34,16 @@ outputs are stored under `results/cifar/`.
 
 ## Run experiments
 
+New runs save under `/project/LongGroup/zonghaoc/mmd_flow_hudson_new/results/`.
+The trainer, shared launcher, and LSF submission scripts route new relative
+destinations such as `results/cifar/my_run` to that directory, including logs,
+checkpoints, metrics, and source snapshots. New absolute paths under the old home
+`results/` directory are routed there too. Existing runs retain their recorded
+paths; the already-running primed DiT study remains in home storage.
+`MMD_RESULTS_ROOT` can override the root; an explicit absolute destination outside
+the old home results directory is also honored. Missing LongGroup access fails
+normally rather than falling back to home storage.
+
 ### Reconstruction priming (two-stage CIFAR-10)
 
 The optional reconstruction stage adapts Eq. (1) of
@@ -121,6 +131,48 @@ uses all eligible training images; positive sizes select a fixed subset.
 Without either duration option, the CLI defaults to 2,000 updates.
 
 ## Backbones
+
+The compact CIFAR transformer is selected with `--architecture dit`. Its defaults
+are 2x2 patches (256 tokens), width 384, 12 blocks, six attention heads, and a
+4x GELU MLP. `--dit-width`, `--dit-depth`, `--dit-heads`, and `--dit-patch-size`
+configure it. This unconditional DiT-style generator uses fixed 2D sine/cosine
+positions, learned constant adaLN-Zero modulation, no dropout, and a sigmoid
+pixel head. It has no time/class input and uses the same distributional objectives
+as the U-Net. The small nonzero output head lets residual gates learn immediately.
+
+The primed DiT comparison uses its own 80-epoch reconstruction stage, followed by
+250,000 updates of corrected softmax Riesz without field RMS normalization.
+Post-training transfers both DiT online and EMA weights with fresh Adam state;
+U-Net checkpoints are incompatible. Seed 42, generated/real batches 128/256,
+multiscale weights 2:1:1, four crops per size, EMA 0.9999, and the LR schedule
+2e-4 to 1e-4 match the corrected U-Net reference. FID-10K runs every 2,500
+post-training updates and checkpoints every 20,000. The architecture is smaller
+than the 56M U-Net, so this comparison does not match parameter count.
+
+```bash
+# Without --submit, only create the frozen source and exact command manifest.
+.venv/bin/python scripts/lsf/submit_compact_dit.py \
+  --study results/cifar/priming_compact_dit_seed42_20261026 --submit
+```
+
+One GPU job runs the full-batch smoke check, reconstruction, and post-training
+sequentially. It records stage status and supports restart from each stage's latest
+checkpoint via `scripts/lsf/run_compact_dit.py --manifest STUDY/manifest.json`.
+Use `--dry-run` on that worker to print the recorded commands.
+
+For perceptual priming, install `lpips==0.1.4` and pass `--lpips-weight 0.1`
+to `scripts/lsf/submit_compact_dit.py`, using a fresh study name. Reconstruction
+then minimizes `[0,1]` pixel MSE plus `0.1 * LPIPS` with frozen VGG16 and calibrated
+LPIPS v0.1 weights. This weight is an initial experimental choice, not a tuned
+CIFAR optimum. LPIPS receives native 32x32 RGB images, converted internally to
+`[-1,1]`, with no resizing. The 80-epoch priming budget and pixel-only Riesz
+post-training recipe are retained. The encoder is used only during priming;
+its weights are frozen but gradients pass through it to the generator.
+The launcher stores its pretrained-weight cache inside the project study,
+records weight hashes and package versions, and tests the perceptual objective
+in the GPU smoke check. Reconstruction metrics report MSE, LPIPS, and their
+weighted total separately. Direct `main.py` use requires both `--lpips-weight`
+and an explicit `--lpips-cache`; LPIPS is rejected outside CIFAR reconstruction.
 
 For CIFAR-10 H100 submission with `-P aihub_ucl` and result copying back from
 the cluster, see [scripts/cs_cluster/README.md](scripts/cs_cluster/README.md).
@@ -334,6 +386,26 @@ or checkpoints cannot be evaluated retrospectively. New runs evaluate the
 live generator directly.
 
 ## Comparisons and checks
+
+Softmax Riesz unit directions use direct pairwise differences, with queries
+chunked in groups of 32 while retaining the full softmax support. This avoids
+false zero distances and cancellation in weighted coordinate sums when
+features nearly coincide. Batch distance scaling also uses direct distances.
+The detached fixed-point target, temperature weights, and normalization options
+are unchanged. Regression tests cover near-collisions, exact duplicates, and
+weighted supports against explicit reference calculations.
+
+The corrected CIFAR no-RMS run is
+`results/cifar/priming_softmax_no_rms_directdiff_seed42_20261026/` (current LSF job
+49819812; initial job 49819790). It starts from the same 80-epoch reconstruction
+checkpoint with
+temperatures 0.2/0.05/0.02, peak LR 2e-4, 1,000-update warmup, and EMA 0.9999.
+It requests one exclusive full GPU and four CPU cores. All four active CIFAR
+runs evaluate FID-10K every 2,500 updates and save/retain
+checkpoints every 20,000 updates plus completion. Extra best-FID copies are
+disabled. The workers refresh the comparison notebook after new FID scores.
+Each run's frozen source and manifest preserve its deployed recipe. The earlier no-RMS
+run and shared-GPU Sinkhorn pair continue independently.
 
 `notebooks/compare_unet_riesz.ipynb` selects the two exact MNIST seed-0 U-Net
 runs. It verifies matching settings, initial-image/data-index hashes, and

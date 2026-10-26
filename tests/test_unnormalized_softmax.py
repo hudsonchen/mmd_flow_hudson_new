@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from loss import _riesz_topk_softmax_loss_impl
+from loss import _riesz_topk_softmax_loss_impl, _softmax_toward
 from main import generator_step
 from multiscale import multiscale_loss
 import test_priming
@@ -17,6 +17,48 @@ class UnnormalizedSoftmaxTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(19)
         torch.set_num_threads(1)
+
+    def test_near_collisions_match_double_precision_unit_directions(self):
+        # More than 25 points exercises the sizes where cdist used the unstable
+        # squared-norm matrix identity; more than 32 queries crosses a chunk.
+        x = .5 + torch.randn(2, 37, 147) * 1e-4
+        for self_interaction in (False, True):
+            y = x.clone() if self_interaction else .5 + torch.randn(2, 41, 147) * 1e-4
+            if self_interaction:
+                y[:, 33] = y[:, 0]
+                x[:, 33] = x[:, 0]
+            tau = .02 * 147**.5
+            actual, ess = _softmax_toward(x, y, torch.ones(y.shape[:2]), tau, 1e-8,
+                                          exclude_self=self_interaction)
+            delta = y.double()[:, None] - x.double()[:, :, None]
+            distances = delta.norm(dim=-1)
+            logits = -distances / tau
+            if self_interaction:
+                logits.masked_fill_(torch.eye(37, dtype=torch.bool)[None], -torch.inf)
+            weights = logits.softmax(-1)
+            expected = (weights[..., None] * delta / distances.clamp_min(1e-8)[..., None]).sum(2)
+            torch.testing.assert_close(actual.double(), expected, atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(ess.double(), 1 / weights.square().sum(-1), atol=1e-5, rtol=1e-5)
+            self.assertLessEqual(actual.norm(dim=-1).max().item(), 1 + 1e-6)
+
+    def test_exact_collisions_have_zero_field_and_gradient(self):
+        x = torch.full((1, 37, 147), .5, requires_grad=True)
+        y = torch.full((1, 41, 147), .5)
+        value, info = _riesz_topk_softmax_loss_impl(
+            x, y, tau_list=(.2, .05, .02), no_field_rms_normalization=True, return_field=True)
+        value.mean().backward()
+        torch.testing.assert_close(info['frozen_velocity'], torch.zeros_like(x), atol=0, rtol=0)
+        torch.testing.assert_close(x.grad, torch.zeros_like(x), atol=0, rtol=0)
+
+    def test_weighted_directions_preserve_support_coefficients(self):
+        x, y = torch.randn(2, 35, 5), torch.randn(2, 43, 5)
+        coefficients = torch.rand(2, 43) * 2
+        actual, _ = _softmax_toward(x, y, coefficients, .2, 1e-8)
+        delta = y[:, None] - x[:, :, None]
+        distances = delta.norm(dim=-1)
+        expected = ((-distances / .2).softmax(-1)[..., None] * coefficients[:, None, :, None]
+                    * delta / distances.clamp_min(1e-8)[..., None]).sum(2)
+        torch.testing.assert_close(actual, expected)
 
     def test_raw_field_and_gradient_against_pairwise_formula(self):
         x = torch.rand(1, 4, 5, requires_grad=True)
@@ -98,8 +140,9 @@ class UnnormalizedSoftmaxTests(unittest.TestCase):
                       '--max-grad-norm', '0.000001']
             full = helper.run_training(root / 'full', common + ['--steps', '5'])
             helper.run_training(root / 'resume', common + ['--steps', '3'])
-            resumed = helper.run_training(root / 'resume', common + ['--steps', '5', '--resume',
+            resumed = helper.run_training(root / 'resume', common + ['--steps', '5', '--save-every', '5', '--resume',
                                            str(root / 'resume/checkpoint_latest.pt')])
+            self.assertEqual(resumed['config']['snapshot_iterations'], [0, 5])
             self.assertEqual(resumed['config']['softmax_field_normalization'], 'none')
             self.assertFalse(resumed['config']['normalize_per_temperature'])
             for name in full['model']:

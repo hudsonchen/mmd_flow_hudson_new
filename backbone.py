@@ -251,10 +251,96 @@ class CIFAR10UNetParticleGenerator(torch.nn.Module):
 
 
 
-def build_backbone(dataset, architecture, latent_dim, base_channels, hidden_dims, num_res_blocks):
+class DiTBlock(torch.nn.Module):
+    """Unconditional DiT-style block with learned constant adaLN-Zero modulation.
+
+    A time/class embedding is unnecessary for the one-pass distributional model.
+    Its six modulation vectors are therefore learned directly, independently per
+    block. Zero gates initialize each attention/MLP residual branch to identity.
+    """
+
+    def __init__(self, width, heads):
+        super().__init__()
+        self.heads = heads
+        self.norm1 = torch.nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.norm2 = torch.nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.qkv = torch.nn.Linear(width, 3 * width)
+        self.projection = torch.nn.Linear(width, width)
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(width, 4 * width),
+                                       torch.nn.GELU(approximate='tanh'),
+                                       torch.nn.Linear(4 * width, width))
+        self.modulation = torch.nn.Parameter(torch.zeros(6, width))
+
+    def forward(self, tokens):
+        shift1, scale1, gate1, shift2, scale2, gate2 = self.modulation.unbind(0)
+        batch, count, width = tokens.shape
+        normalized = self.norm1(tokens) * (1 + scale1) + shift1
+        qkv = self.qkv(normalized).reshape(batch, count, 3, self.heads, width // self.heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        attended = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        tokens = tokens + gate1 * self.projection(attended.transpose(1, 2).reshape(batch, count, width))
+        return tokens + gate2 * self.mlp(self.norm2(tokens) * (1 + scale2) + shift2)
+
+
+class CIFAR10DiTParticleGenerator(torch.nn.Module):
+    """Compact unconditional patch transformer producing pixels in one pass.
+
+    DiT-style architecture, not a diffusion/MeanFlow objective. Fixed 2D sine/
+    cosine positions and global attention operate on nonoverlapping noise patches.
+    A small nonzero pixel head lets residual gates receive gradients immediately.
+    """
+
+    def __init__(self, width=384, depth=12, heads=6, patch_size=2):
+        super().__init__()
+        if (width <= 0 or depth <= 0 or heads <= 0 or patch_size <= 0
+                or width % heads or width % 4 or 32 % patch_size):
+            raise ValueError('DiT requires positive sizes, width divisible by heads and 4, and patch size dividing 32')
+        self.patch_size = patch_size
+        self.grid_size = 32 // patch_size
+        self.patch_embed = torch.nn.Conv2d(3, width, patch_size, stride=patch_size)
+        coordinates = torch.arange(self.grid_size, dtype=torch.float32)
+        y, x = torch.meshgrid(coordinates, coordinates, indexing='ij')
+        frequencies = 10000 ** (-torch.arange(width // 4, dtype=torch.float32) / (width // 4))
+        phases = [axis.flatten()[:, None] * frequencies for axis in (y, x)]
+        positions = torch.cat([part for phase in phases for part in (phase.sin(), phase.cos())], dim=1)
+        self.register_buffer('positions', positions.unsqueeze(0))
+        self.blocks = torch.nn.ModuleList([DiTBlock(width, heads) for _ in range(depth)])
+        self.norm = torch.nn.LayerNorm(width, eps=1e-6)
+        self.head = torch.nn.Linear(width, 3 * patch_size ** 2)
+        for module in self.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                torch.nn.init.zeros_(module.bias)
+        torch.nn.init.xavier_uniform_(self.patch_embed.weight.flatten(1))
+        torch.nn.init.zeros_(self.patch_embed.bias)
+        torch.nn.init.normal_(self.head.weight, std=1e-3)
+
+    def unpatchify(self, patches):
+        batch = patches.shape[0]
+        grid, patch = self.grid_size, self.patch_size
+        # Patch vectors store row, column, channel; output uses CHW ordering.
+        pixels = patches.reshape(batch, grid, grid, patch, patch, 3)
+        return pixels.permute(0, 5, 1, 3, 2, 4).reshape(batch, 3, 32, 32)
+
+    def forward(self, latent):
+        if latent.ndim != 2 or latent.shape[1] != 3072:
+            raise ValueError('CIFAR DiT expects flattened noise with shape (batch, 3072)')
+        tokens = self.patch_embed(latent.reshape(-1, 3, 32, 32)).flatten(2).transpose(1, 2)
+        tokens = tokens + self.positions
+        for block in self.blocks:
+            tokens = block(tokens)
+        return self.unpatchify(self.head(self.norm(tokens))).sigmoid().flatten(1)
+
+
+def build_backbone(dataset, architecture, latent_dim, base_channels, hidden_dims, num_res_blocks,
+                   *, dit_width=384, dit_depth=12, dit_heads=6, dit_patch_size=2):
     """Construct an architecture without dataset-specific trainer entry points."""
     if architecture == "mlp":
         return ParticleGenerator(latent_dim, tuple(hidden_dims), 784 if dataset == "mnist" else 3072)
+    if architecture == 'dit':
+        if dataset != 'cifar10' or latent_dim != 3072:
+            raise ValueError('DiT currently supports CIFAR-10 with latent_dim=3072')
+        return CIFAR10DiTParticleGenerator(dit_width, dit_depth, dit_heads, dit_patch_size)
     if architecture != "unet":
         raise ValueError(f"Unknown architecture: {architecture}")
     if dataset == "mnist":
@@ -264,9 +350,19 @@ def build_backbone(dataset, architecture, latent_dim, base_channels, hidden_dims
     raise ValueError(f"Unknown dataset: {dataset}")
 
 
-def backbone_metadata(dataset, architecture, latent_dim, base_channels, hidden_dims, num_res_blocks):
+def backbone_metadata(dataset, architecture, latent_dim, base_channels, hidden_dims, num_res_blocks,
+                      *, dit_width=384, dit_depth=12, dit_heads=6, dit_patch_size=2):
     if architecture == "mlp":
         return [latent_dim, *hidden_dims, 784 if dataset == "mnist" else 3072]
+    if architecture == 'dit':
+        return dict(name='cifar10_compact_dit_onepass', input_shape=[3, 32, 32],
+                    width=dit_width, depth=dit_depth, heads=dit_heads, patch_size=dit_patch_size,
+                    tokens=(32 // dit_patch_size) ** 2, mlp_ratio=4,
+                    normalization='LayerNorm', positional_embedding='fixed_2d_sincos',
+                    modulation='learned_constant_adaln_zero', dropout=0.,
+                    time_conditioning=False, class_conditioning=False,
+                    sampling_network_evaluations=1, output_activation='sigmoid',
+                    initialization='xavier_linear_zero_residual_gates_pixel_head_std_1e-3')
     metadata = {
         "name": "compact_residual_unet" if dataset == "mnist" else "cifar10_ddpmpp_onepass_unet",
         "channels": [base_channels, 2 * base_channels, 4 * base_channels] if dataset == "mnist"

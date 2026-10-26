@@ -16,6 +16,7 @@ import time
 import torch
 
 from backbone import CIFAR10UNetParticleGenerator
+from run_storage import new_run_path
 from data import download_cifar10, load_cifar10_split
 from visualization import save_grid
 
@@ -121,6 +122,8 @@ def main():
     parser.add_argument('--device', default='cuda', choices=('cuda', 'cpu'))
     parser.add_argument('--resume', type=Path)
     args = parser.parse_args()
+    if not args.resume:
+        args.output = new_run_path(args.output)
     if min(args.steps, args.batch_size, args.checkpoint_every, args.preview_every,
            args.sample_batch_size, args.base_channels, args.num_res_blocks) < 1:
         parser.error('Training counts and intervals must be positive')

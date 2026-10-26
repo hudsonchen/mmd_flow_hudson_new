@@ -8,6 +8,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from run_storage import new_run_path
 
 
 def main():
@@ -20,7 +24,7 @@ def main():
                         help='Submit only a fresh 250000-update unprimed MMD-flow baseline')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
-    study = args.study.resolve()
+    study = new_run_path(args.study).resolve()
     study.mkdir(parents=True, exist_ok=False)
     source = study / 'source'
     source.mkdir()
