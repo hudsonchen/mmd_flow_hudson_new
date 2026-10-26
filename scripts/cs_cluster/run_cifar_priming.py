@@ -32,6 +32,7 @@ def commands(repo, study):
             '--ema-decay', '0.9999', '--save-every', '20', '--checkpoint-every', '1',
             '--output', str(study / 'reconstruction')],
         'posttraining': common + ['--steps', '1000000', '--target-batch-size', '256',
+            '--ema-checkpoint-every', '20000',
             '--train-particles', '128', '--ema-decay', '0.9999', '--random-flip',
             '--max-grad-norm', '1', '--warmup-steps', '1000', '--lr-schedule', 'cosine',
             '--min-learning-rate', '0.0001', '--multiscale-loss', '--coarse-sizes', '8', '16',

@@ -238,7 +238,9 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument('--keep-checkpoint-every', type=int, default=0,
                         help='Retain numbered checkpoints at this interval, plus the final checkpoint')
     parser.add_argument('--save-ema-at-fid', action='store_true',
-                        help='Retain evaluation-only EMA weights and the score at every FID report')
+                        help='Retain evaluation-only EMA weights at selected FID reports')
+    parser.add_argument('--ema-checkpoint-every', type=int, default=None,
+                        help='EMA retention interval; 0 keeps every FID, default 20000 post-training steps')
     parser.add_argument('--allow-shorter-budget', action='store_true',
                         help='Explicitly allow resume with an earlier endpoint beyond the saved iteration')
     parser.add_argument("--training-stage", choices=("distributional", "reconstruction"),
@@ -258,6 +260,10 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument('--data-parallel-gpus', type=int, default=1,
                         help='Split generator forwards across this many local GPUs; retain the global particle loss')
     args = parser.parse_args()
+    if args.ema_checkpoint_every is None:
+        args.ema_checkpoint_every = 20000 if args.training_stage == 'distributional' else 0
+    if args.ema_checkpoint_every < 0:
+        parser.error('--ema-checkpoint-every must be nonnegative')
     if args.resume and args.fork_checkpoint:
         parser.error('--resume and --fork-checkpoint are mutually exclusive')
     if (args.train_particles is not None and args.train_particles < 1
@@ -467,7 +473,8 @@ def main(default_dataset: str = "cifar10") -> None:
     config.update(lr_schedule=f'linear_warmup_then_{args.lr_schedule}',
                   training_generated_batch=args.train_particles or args.particles,
                   training_random_horizontal_flip=args.random_flip,
-                  checkpoint_at_fid=bool(args.checkpoint_every and args.dataset == 'cifar10'))
+                  checkpoint_at_fid=bool(args.checkpoint_every and args.dataset == 'cifar10'),
+                  source_main_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     if args.dataset == "cifar10":
         config["class_names"] = CIFAR10_CLASSES
     if initialization is not None:
@@ -585,7 +592,7 @@ def main(default_dataset: str = "cifar10") -> None:
         if 'priming_initialization' in checkpoint['config']:
             config['priming_initialization'] = checkpoint['config']['priming_initialization']
         ignored = {'resume', 'fork_checkpoint', 'threads', 'device', 'checkpoint_every',
-                   'keep_checkpoint_every', 'save_ema_at_fid', 'allow_shorter_budget'}
+                   'keep_checkpoint_every', 'save_ema_at_fid', 'ema_checkpoint_every', 'allow_shorter_budget'}
         tuning_keys = {'output', 'learning_rate', 'lr_schedule', 'min_learning_rate',
                        'schedule_start_update', 'warmup_steps', 'train_particles', 'random_flip',
                        'max_grad_norm', 'ema_decay', 'crops_per_size', 'global_loss_weight',
@@ -829,7 +836,9 @@ def main(default_dataset: str = "cifar10") -> None:
                 save_trajectory(trajectory_states, trajectory_iterations, args.output,
                                 args.trajectory_particles, unit)
                 plot_mmd(history, args.output, unit, fid_history=fid_history)
-            if args.save_ema_at_fid and fid_evaluator is not None and iteration in save_iterations:
+            retain_ema = (not args.ema_checkpoint_every or iteration % args.ema_checkpoint_every == 0
+                          or iteration == total_iterations)
+            if args.save_ema_at_fid and retain_ema and fid_evaluator is not None and iteration in save_iterations:
                 archive = args.output / 'fid_checkpoints'
                 archive.mkdir(exist_ok=True)
                 retained_ema = archive / f'ema_{unit}_{iteration:06d}.pt'

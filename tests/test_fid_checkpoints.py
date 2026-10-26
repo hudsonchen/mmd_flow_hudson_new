@@ -22,12 +22,13 @@ class FIDCheckpointTests(unittest.TestCase):
             data = torch.arange(6 * 3072).reshape(6, 3072).remainder(256).byte()
             labels = torch.zeros(6, dtype=torch.long)
 
-            def run(output, resume=False):
+            def run(output, resume=False, ema_every=0):
                 argv = ['main.py', '--dataset', 'cifar10', '--architecture', 'mlp',
                         '--latent-dim', '8', '--hidden-dims', '8', '--target-size', '0',
                         '--target-batch-size', '2', '--particles', '3', '--eval-size', '4',
                         '--steps', '5', '--save-every', '2', '--checkpoint-every', '3',
                         '--keep-checkpoint-every', '5', '--ema-decay', '.9', '--save-ema-at-fid',
+                        '--ema-checkpoint-every', str(ema_every),
                         '--threads', '1', '--device', 'cpu', '--output', str(output)]
                 if resume:
                     argv += ['--resume', str(output / 'checkpoint_latest.pt')]
@@ -75,6 +76,12 @@ class FIDCheckpointTests(unittest.TestCase):
             self.assertTrue((root / 'resumed/checkpoint_step_000005.pt').exists())
             self.assertEqual(sorted(p.name for p in (root / 'resumed/fid_checkpoints').glob('*.pt')),
                 [f'ema_step_{step:06d}.pt' for step in (0, 2, 4, 5)])
+            sparse = run(root / 'sparse', ema_every=4)
+            self.assertEqual(sparse['fid_history'], full['fid_history'])
+            self.assertEqual(sorted(p.name for p in (root / 'sparse/fid_checkpoints').glob('*.pt')),
+                [f'ema_step_{step:06d}.pt' for step in (0, 4, 5)])
+            for name in full['ema_model']:
+                torch.testing.assert_close(full['ema_model'][name], sparse['ema_model'][name], rtol=0, atol=0)
 
 
 if __name__ == '__main__':

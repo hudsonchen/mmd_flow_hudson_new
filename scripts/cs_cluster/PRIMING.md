@@ -11,12 +11,15 @@ EMA 0.9999, and seed 42. Learning rate warms up for 1,000 steps to 2e-4,
 then follows cosine decay to 1e-4 over the full million updates.
 FID-10K runs every 2,500 steps. The latest resumable checkpoint is saved every
 1,000 steps and at every FID report. Evaluation-only EMA weights are retained
-at every FID report under `fid_checkpoints/`; these files include the exact score,
+every 20,000 post-training steps (plus initialization and the final endpoint)
+under `fid_checkpoints/`; these files include the exact score,
 iteration, update count, and config but no optimizer state. Numbered full
 checkpoints are disabled to fit the complete million-step run in the available
 storage. Scores are stored in `fid_metrics.json`, `metrics.csv`, and the checkpoint's
 `fid_history`. Reconstruction retains the original
 constant 2e-4 learning rate and EMA 0.9999.
+`--ema-checkpoint-every 0` retains every FID snapshot; distributional training
+defaults to 20,000 steps and reconstruction defaults to every FID snapshot.
 
 `--data-parallel-gpus 4` splits generator forwards across the four allocated
 GPUs. Outputs are gathered before the global particle interactions. Batch sizes
