@@ -137,6 +137,7 @@ class UnnormalizedSoftmaxTests(unittest.TestCase):
             root = Path(directory)
             common = ['--training-stage', 'distributional', '--objective', 'softmax-riesz',
                       '--no-field-rms-normalization', '--multiscale-loss',
+                      '--repulsion-weight', '0.5',
                       '--max-grad-norm', '0.000001']
             full = helper.run_training(root / 'full', common + ['--steps', '5'])
             helper.run_training(root / 'resume', common + ['--steps', '3'])
@@ -145,6 +146,7 @@ class UnnormalizedSoftmaxTests(unittest.TestCase):
             self.assertEqual(resumed['config']['snapshot_iterations'], [0, 5])
             self.assertEqual(resumed['config']['softmax_field_normalization'], 'none')
             self.assertFalse(resumed['config']['normalize_per_temperature'])
+            self.assertEqual(resumed['config']['softmax_repulsion_weight'], .5)
             for name in full['model']:
                 torch.testing.assert_close(full['model'][name], resumed['model'][name], rtol=0, atol=0)
             with (root / 'resume/training_diagnostics.csv').open() as stream:
@@ -152,6 +154,47 @@ class UnnormalizedSoftmaxTests(unittest.TestCase):
             self.assertEqual([int(row['update']) for row in rows], [1, 2, 3, 4, 5])
             self.assertTrue(all(float(row['clip_fraction']) == 1 for row in rows))
             self.assertTrue(all(float(row['raw_force_rms']) > 0 for row in rows))
+
+    def test_repulsion_weight_preserves_attraction_scale_and_halves_negative_fields(self):
+        x = torch.rand(1, 6, 5, requires_grad=True)
+        y, negative = torch.rand(1, 9, 5), torch.rand(1, 3, 5)
+        results = {}
+        for weight in (0., .5, 1.):
+            value, info = _riesz_topk_softmax_loss_impl(
+                x, y, fixed_neg=negative, repulsion_weight=weight,
+                no_field_rms_normalization=True, return_field=True)
+            results[weight] = info
+            gradient = torch.autograd.grad(value.mean(), x)[0]
+            torch.testing.assert_close(
+                gradient, -2 * info['frozen_velocity'] / (x.numel() * info['scale_inputs']))
+        half, full, attraction = results[.5], results[1.], results[0.]
+        torch.testing.assert_close(half['scale_inputs'], full['scale_inputs'], rtol=0, atol=0)
+        torch.testing.assert_close(half['riesz_topk_softmax_attraction_rms'],
+                                   full['riesz_topk_softmax_attraction_rms'], rtol=0, atol=0)
+        for name in ('self_repulsion', 'fixed_negative'):
+            torch.testing.assert_close(half[f'riesz_topk_softmax_{name}_rms'],
+                                       .5 * full[f'riesz_topk_softmax_{name}_rms'])
+        torch.testing.assert_close(half['frozen_velocity'],
+                                   .5 * (full['frozen_velocity'] + attraction['frozen_velocity']))
+
+    def test_repulsion_weight_reaches_all_multiscale_views_and_target_route(self):
+        x, y = torch.rand(6, 16, requires_grad=True), torch.rand(9, 16)
+        options = dict(image_shape=(1, 4, 4), chunk_size=8, coarse_sizes=(2,),
+                       patch_sizes=(2,), crops_per_size=2, no_field_rms_normalization=True)
+        results = {}
+        for route in (None, {'field_step': 1.}):
+            for weight in (0., .5, 1.):
+                value, info = multiscale_loss(
+                    x, y, repulsion_weight=weight, target_options=route,
+                    patch_rng=torch.Generator().manual_seed(3), **options)
+                results[(route is None, weight)] = (torch.autograd.grad(value, x)[0], info)
+        for direct in (True, False):
+            half, full, attraction = [results[(direct, w)] for w in (.5, 1., 0.)]
+            torch.testing.assert_close(half[0], .5 * (full[0] + attraction[0]))
+            torch.testing.assert_close(half[1]['raw_attraction_rms'], full[1]['raw_attraction_rms'])
+            torch.testing.assert_close(half[1]['raw_self_repulsion_rms'],
+                                       .5 * full[1]['raw_self_repulsion_rms'])
+        torch.testing.assert_close(results[(True, .5)][0], results[(False, .5)][0])
 
 
 if __name__ == '__main__':

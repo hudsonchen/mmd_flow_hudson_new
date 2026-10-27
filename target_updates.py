@@ -6,7 +6,8 @@ from loss import _riesz_topk_softmax_loss_impl, raw_field_diagnostics
 
 def softmax_target_loss(features, target, *, tau_list,
                         normalize_per_temperature, field_step=1.0,
-                        noise_levels=(0.0,), noise_rng=None, no_field_rms_normalization=False):
+                        noise_levels=(0.0,), noise_rng=None, no_field_rms_normalization=False,
+                        repulsion_weight=1.0):
     losses = []
     diagnostics = {}
     for sigma in noise_levels:
@@ -24,7 +25,8 @@ def softmax_target_loss(features, target, *, tau_list,
                 x.detach().unsqueeze(0), y.unsqueeze(0), tau_list=tau_list,
                 normalize_per_temperature=normalize_per_temperature,
                 epsilon=1e-6, return_field=True,
-                no_field_rms_normalization=no_field_rms_normalization)
+                no_field_rms_normalization=no_field_rms_normalization,
+                repulsion_weight=repulsion_weight)
             if no_field_rms_normalization:
                 for name, value in raw_field_diagnostics(info).items():
                     diagnostics.setdefault(name, []).append(value)

@@ -74,6 +74,7 @@ def main():
             index = post.index(flag)
             del post[index:index + 2]
     for flag, value in [('--output', posttraining), ('--init-checkpoint', reconstruction / 'checkpoint_latest.pt'),
+                        ('--save-every', 5000),
                         ('--data-root', repo / 'data'), ('--threads', 4), *zip(dit[::2], dit[1::2])]:
         set_option(post, flag, value)
     manifest = dict(study=str(study), created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),

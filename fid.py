@@ -85,7 +85,7 @@ class CIFAR10FID:
             raise ValueError("batch_size must be positive")
         self.device, self.batch_size = device, batch_size
         self.inception = load_inception(device)
-        print(f"Computing FID reference statistics: {len(real_images)} CIFAR-10 images", flush=True)
+        print(f"Computing FID reference statistics: {len(real_images)} reference images", flush=True)
         self.reference = self.statistics(real_images)
 
     def statistics(self, images):

@@ -20,8 +20,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('data', type=Path)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--repulsion-weight', type=float, default=1.0)
     parser.add_argument('--lpips-weight', type=float, default=0.0)
     parser.add_argument('--lpips-cache', type=Path)
+    parser.add_argument('--softmax-feature-space', choices=['pixels', 'vgg'], default='pixels')
+    parser.add_argument('--perceptual-pool-size', type=int, default=4)
+    parser.add_argument('--vgg-multiscale', action='store_true')
+    parser.add_argument('--train-particles', type=int, default=128)
+    parser.add_argument('--target-batch-size', type=int, default=256)
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--fresh-optimizer', action='store_true')
     args = parser.parse_args()
     torch.set_num_threads(4)
     torch.manual_seed(42)
@@ -31,15 +39,22 @@ def main():
     targets = images.cuda().float() / 255
     model = build_backbone('cifar10', 'dit', 3072, 128, [128, 256], 4).cuda()
     ema = copy.deepcopy(model).requires_grad_(False).eval()
+    saved = None
+    if args.checkpoint:
+        saved = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        model.load_state_dict(saved['model'])
+        ema.load_state_dict(saved['ema_model'])
     inception = load_inception('cuda')
     perceptual_loss = None
-    if args.lpips_weight:
+    if args.lpips_weight or args.softmax_feature_space == "vgg":
         from perceptual import VGGPerceptualLoss
         perceptual_loss = VGGPerceptualLoss(args.lpips_cache, 'cuda')
     timings = {}
     stage_diagnostics = {}
-    for stage in ('reconstruction', 'distributional'):
+    for stage in (('distributional',) if saved is not None else ('reconstruction', 'distributional')):
         optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
+        if saved is not None and not args.fresh_optimizer:
+            optimizer.load_state_dict(saved['optimizer'])
         torch.cuda.synchronize()
         started = time.monotonic()
         for _ in range(3):
@@ -47,12 +62,17 @@ def main():
                 info = reconstruction_step(model, targets[:64], torch.randn(64, 3072, device='cuda'), optimizer,
                                            perceptual_loss=perceptual_loss, perceptual_weight=args.lpips_weight)
             else:
-                info = generator_step(model, torch.randn(128, 3072, device='cuda'), targets[:256],
+                info = generator_step(model, torch.randn(args.train_particles, 3072, device='cuda'), targets[:args.target_batch_size],
                     optimizer, 64, objective='softmax-riesz', normalize_per_temperature=False,
                     no_field_rms_normalization=True, max_grad_norm=1.,
+                    repulsion_weight=args.repulsion_weight,
+                    feature_encoder=perceptual_loss, softmax_feature_space=args.softmax_feature_space,
+                    perceptual_pool_size=args.perceptual_pool_size,
+                    vgg_multiscale=args.vgg_multiscale,
                     multiscale_options=dict(image_shape=(3, 32, 32), coarse_sizes=(8, 16),
                         patch_sizes=(7, 14), crops_per_size=4, global_weight=2.,
-                        coarse_weight=1., patch_weight=1., patch_rng=torch.Generator().manual_seed(44)))
+                        coarse_weight=1., patch_weight=1., patch_rng=torch.Generator().manual_seed(44))
+                        if args.softmax_feature_space == "pixels" else None)
             update_ema(model, ema, .9999)
             assert all(torch.isfinite(torch.as_tensor(v)).all() for v in info.values())
         torch.cuda.synchronize()
@@ -61,7 +81,6 @@ def main():
                                     for name, value in info.items()}
         if perceptual_loss is not None:
             assert all(p.grad is None and not p.requires_grad for p in perceptual_loss.parameters())
-        del optimizer
     assert all(torch.isfinite(p).all() for p in model.parameters())
     assert model.blocks[0].qkv.weight.grad.abs().sum() > 0
     with torch.no_grad():
@@ -75,8 +94,12 @@ def main():
     result = dict(status='passed', gpu=torch.cuda.get_device_name(),
                   parameter_count=sum(p.numel() for p in model.parameters()),
                   seconds_per_update=timings, peak_gib=torch.cuda.max_memory_allocated() / 2**30,
-                  generated_batch=128, real_batch=256, fid_batch=64,
+                  generated_batch=args.train_particles, real_batch=args.target_batch_size, fid_batch=64,
+                  vgg_multiscale=args.vgg_multiscale,
                   objective='softmax-riesz', field_rms_normalization='none',
+                  repulsion_weight=args.repulsion_weight,
+                  softmax_feature_space=args.softmax_feature_space,
+                  perceptual_pool_size=args.perceptual_pool_size,
                   pretraining_lpips_weight=args.lpips_weight, stage_diagnostics=stage_diagnostics,
                   perceptual=perceptual_loss.metadata if perceptual_loss is not None else None,
                   softmax_numerics='direct_pairwise_differences', unit_average_norm=bound)

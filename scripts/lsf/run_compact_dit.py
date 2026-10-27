@@ -50,6 +50,9 @@ def main():
                 continue
             command = list(record['command'])
             if (output / 'checkpoint_latest.pt').exists():
+                if '--fork-checkpoint' in command:
+                    index = command.index('--fork-checkpoint')
+                    del command[index:index + 2]
                 set_option(command, '--resume', output / 'checkpoint_latest.pt')
             status = dict(stage=record['stage'], status='running', job_id=os.environ.get('LSB_JOBID'),
                           host=os.uname().nodename, command=command,

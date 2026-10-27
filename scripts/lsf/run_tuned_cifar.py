@@ -48,7 +48,7 @@ def main():
                    train_particles=128, random_flip=True, max_grad_norm=1., ema_decay=.9999,
                    crops_per_size=4, global_loss_weight=2., coarse_loss_weight=1.,
                    patch_loss_weight=1., checkpoint_every=1000, keep_checkpoint_every=25000,
-                   resume=None, fork_checkpoint=record['checkpoint'])
+                   save_every=5000, resume=None, fork_checkpoint=record['checkpoint'])
     if args.objective is not None:
         options['objective'] = args.objective
     if options['objective'] == 'sinkhorn':

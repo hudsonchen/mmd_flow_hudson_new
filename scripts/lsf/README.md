@@ -1,5 +1,37 @@
 # CIFAR-10 priming on LSF
 
+## Multiscale VGG DiT continuation
+
+Add `--restart-from-priming` and provide a completed reconstruction checkpoint
+to start fresh post-training at update zero. This retains reconstruction online
+weights and EMA but resets Adam, random streams, and the 1,000-update warmup;
+no distributional training history or optimizer state is inherited. The GPU
+smoke check uses the same initialization choice.
+
+`launch_vgg_multiscale.py --source-study STUDY --checkpoint NUMBERED_CHECKPOINT
+--name NAME --submit` forks a preserved distributional checkpoint into project
+storage using `run_storage.new_run_path`. It keeps online weights, EMA, Adam,
+random states, and the original learning-rate schedule. The combined experiment
+defaults to the original 128 generated and 256 real images per interaction batch;
+`--train-particles` and `--target-batch-size` explicitly override these sizes. It uses FID-10K
+every 5,000 updates, recovery checkpoints every 1,000, and numbered checkpoints
+every 5,000. Prior metrics through the fork point are inherited history.
+
+`--vgg-multiscale --perceptual-pool-size 8` computes 15 equally weighted fields:
+for each of five channel-normalized VGG layers, spatial features pooled to at
+most 8x8, local 2x2 mean/std maps pooled to at most 4x4, and global channel
+mean/std. Every branch has independent batch-distance scaling and neighbor
+weights. Temperatures, repulsion, and the absence of field RMS normalization
+remain unchanged. Per-branch force RMS and effective neighbor counts are logged.
+
+The launcher freezes source and tests, copies the initialization and VGG assets,
+runs the test suite, and submits a full-size GPU smoke check followed by training.
+The smoke check loads the actual source model, EMA, and Adam state, keeps the
+dataset and FID network resident, and checks gradients, memory, and FID features
+at the requested batch sizes. It must pass before training begins. Queue and GPU
+memory request can be set explicitly; defaults target an exclusive A100 on
+`longgpu02` with a 32-GB minimum-memory request.
+
 ## DDPM architecture sanity check
 
 `ddpm.py` trains standard discrete epsilon-prediction DDPM on the existing
@@ -69,7 +101,7 @@ updates, seed 42, multiscale objective, optimizer, EMA, and evaluation settings:
 
 This submits only the baseline stage, from random initialization, in a new
 output directory. It neither resumes the cancelled baseline nor launches
-reconstruction. FID-10K runs every 2,500 updates and checkpoints every 1,000.
+reconstruction. New jobs run FID-10K every 5,000 updates and checkpoints every 1,000.
 
 This checkout is on the Penn LSF cluster. Its `dbeigpu` queue provides H200s;
 the older `scripts/cs_cluster/` launchers target a separate SGE cluster.
@@ -109,7 +141,7 @@ experiment.
 
 FID-10K uses all 50,000 training images as the reference. Reconstruction saves
 FID and image grids at epochs 0/20/40/60/80; distributional stages save at step
-0 and every 2,500 steps. Checkpoints are saved every reconstruction epoch and
+0 and every 5,000 steps for new jobs. Checkpoints are saved every reconstruction epoch and
 every 1,000 post-training steps, plus final checkpoints. The next stage loads
 online reconstruction weights and inherits its EMA; it resets the optimizer.
 
@@ -288,3 +320,118 @@ the best completed FID under `checkpoints/best_fid/` and refreshes the compariso
 notebook when new FID scores arrive. Separate outputs, checkpoints, and RNG
 states are maintained for each trainer. The pair manifest records both exact
 commands, and each study retains a frozen source snapshot with hashes.
+# Small reference-process CIFAR experiments
+
+`launch_small_flow.py --dataset cifar10 --name NAME` freezes the RGB reference-flow
+implementation and submits to `longgpu` on `longgpu01`. New artifacts go to
+`/project/LongGroup/zonghaoc/mmd_flow_hudson_new/results/cifar/NAME`; the launcher
+uses `run_storage.new_run_path` and never falls back to home storage. CIFAR uses
+native 3×32×32 images, per-channel local statistics, and the same configurable
+small U-Net as the grayscale studies. `--deep --width 32` has 1,372,035 parameters.
+`--random-flip` augments both reconstruction priming and transport training.
+
+FID defaults to 10,000 generated images against all 50,000 training images every
+5,000 transport optimizer updates. `--fid-reference-samples` explicitly overrides
+the reference count. Final training evaluation also reports test FID; use
+`audit_small_image_flow.py` with an independent noise seed for confirmation after
+checkpoint selection. Sampling solver, step count and network evaluations must
+be included in comparisons. Reconstruction priming updates are additional to
+the reported transport updates.
+
+Riesz permits reconstruction-only priming and Riesz-only continuation. Parent
+dataset and ancestry checks reject incompatible checkpoints or FM weight
+transfer. A `path-endpoint` run combines endpoint and next-reference-marginal
+Riesz losses; `reference-hybrid` additionally uses a velocity-MSE loss and must
+be labeled as a hybrid. The separate FM baseline does not supply any weights.
+
+Before a new configuration is trained, `--smoke` tests full backward passes on
+the allocated GPU. The October 27 RGB preflight passed on a 2080 Ti with PyTorch
+2.7.1+cu126: batch 128, 20 checkpointed rollout steps, and reconstruction/spatial
+features used 1.95 GB peak allocated memory. This excludes the FID network and
+optimizer states and is a capacity check, not a quality measurement.
+
+`review_cifar_perceptual.py --output cifar/REVIEW_NAME` snapshots the recorded
+October 26 VGG and LPIPS experiments without modifying them. It verifies the
+actual reconstruction checkpoint hashes, records scheduler status, and writes
+JSON/CSV evidence plus FID and sample comparison figures. LPIPS reconstruction
+priming, unpaired VGG distribution matching, and the additive VGG-field pilot
+are reported separately.
+
+The small RGB trainer accepts `--vgg-endpoint-weight 1 --vgg-pool-size 8
+--vgg-cache CACHE` to average its existing endpoint objective with 15 independent
+VGG feature Riesz fields. The next-reference-marginal loss remains in pixel
+space. VGG inputs use the unclipped affine conversion from centered RGB states;
+the encoder is frozen, targets are detached, and LPIPS pairwise heads are unused.
+The launcher copies the cached VGG16 weights into each new study and records their
+hash. A completed `reconstruction.pt` can be supplied through `--fork`; the
+generator and frozen reconstruction encoder are both restored and verified
+against that reconstruction-only checkpoint. This supports feature comparisons
+without repeating priming or inheriting FM weights. A fork starts new optimizer
+and random streams; comparisons with uninterrupted training are recipe comparisons.
+
+`launch_small_flow.py --dataset cifar10 --gradient-diagnostic --name NAME
+--checkpoint CHECKPOINT --recipe CONFIG --device cuda --batch 128 --repeats 16`
+freezes a checkpoint and loss recipe, then measures endpoint and local-reference
+parameter gradients without optimizer updates. It reports their norms and
+alignment across time, including the candidate `(1-t)` reference weighting.
+Use an explicit `--vgg-cache` for a VGG recipe. These diagnostics guide ablations;
+they do not establish an improvement in FID. The launcher's default storage and
+2080 Ti placement also apply to this mode.
+
+For a small sampling check while GPUs train, `audit_small_image_flow.py
+--preview-only --device cpu --preview-count 16` supports CPU previews. It records
+the device, count, solver and noise seed and rejects nonfinite samples. CPU and
+CUDA random streams differ even for the same seed. FID audits still require CUDA;
+small previews cannot establish image quality or diversity.
+
+`audit_cifar_perceptual.py --output cifar/AUDIT_NAME` copies the two saved
+multiscale-VGG update-25,000 checkpoints and one atomic snapshot of the running
+FM checkpoint, freezes their compatible archived implementations, and submits
+an independent FID-10K evaluation against all 10,000 CIFAR test images. It records
+the exact FM update, checkpoint hashes, common fresh noise seed, sampling cost,
+and GPU memory. This evaluation never updates the models or their original runs.
+
+The reference trainer also supports `--architecture dit --dit-width 384
+--dit-depth 12 --dit-heads 6 --dit-patch-size 2` (32,253,324 parameters).
+For reconstruction initialization, use `--parameterization denoiser
+--dit-prime-checkpoint CHECKPOINT --solver euler`. The checkpoint must be a
+from-scratch reconstruction stage; its SHA256 and exact EMA tensor transfer are
+verified. New time modulation output gates start at zero, preserving the primed
+clean prediction at initialization. No FM weights or optimizer state transfer.
+The DiT currently uses pixel and optional VGG endpoint features. Fixed-corruption
+priming can produce saturated multi-step samples before transport training;
+`--preview-every 1000` records 32-image EMA diagnostics from update zero without
+changing the FID schedule. These previews are not quality estimates.
+
+For the H200 host, use launcher options `--queue dbeigpu --host dbei-ai1
+--gpu-mig 7/7 --gpu-memory 128 --cpus 4 --memory-gb 16`. Explicit GPU and compute
+instance sizes matter: the October 27 request for 32 GB without a MIG size was
+assigned a `2g.35gb` partition. The full-size request was assigned `7/7` by LSF.
+Use `--smoke` before training to verify the visible device, finite gradients,
+memory and runtime. `--exclusive` is for non-MIG compute mode and cannot be
+combined with `--gpu-mig`. Default launcher placement remains the 2080 Ti host.
+
+For a cheaper reference-process candidate, `--smoke --local-only
+--local-diagnostics 4 --affinity row-column --feature-space pixels` compares
+single-transition Riesz objectives with independent, paired, and paired
+leave-one-out reference populations. It performs no endpoint rollout backward
+pass and no optimizer updates. The diagnostic reports gradient alignment with
+the analytic affine-path velocity-MSE gradient, without a teacher model or FM
+weight transfer. This alignment alone cannot establish image quality. The
+training objective `--objective coupled --reference-coupling paired` reuses the
+same sampled image/noise particles across adjacent reference marginals, while
+retaining all-target Riesz attraction and generated-particle repulsion. It must
+be distinguished from independent-population distribution matching.
+
+`--objective local-hybrid --parameterization denoiser --reference-weight 1
+--riesz-weight 0.1` jointly trains paired clean-image reference MSE and the local
+Riesz loss from one network call. Clean-image MSE is the affine conditional
+velocity-MSE objective weighted by `(1-t)^2`, which avoids the denoiser Jacobian
+singularity. `--reference-coupling paired-loo --reference-time-power 1` selects
+matched-target exclusion and remaining-time weighting for the Riesz term.
+This is explicitly a hybrid supervised/distributional objective, not pure Riesz
+and not a separately trained FM initialization. Both loss weights must be
+positive. It uses no rollout loss, trained FM teacher, or VGG post-training
+encoder. Reconstruction-only LPIPS priming remains supported. The local smoke
+test accepts `--local-hybrid` to verify finite backward gradients and measure its
+incremental cost against plain local Riesz on the same GPU allocation.

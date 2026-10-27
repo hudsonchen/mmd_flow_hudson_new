@@ -55,6 +55,10 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
                    sinkhorn_epsilon: float = 0.05, sinkhorn_iters: int = 10,
                    max_grad_norm: float = 0.0,
                    no_field_rms_normalization: bool = False,
+                   repulsion_weight: float = 1.0,
+                   feature_encoder=None, softmax_feature_space: str = "pixels",
+                   perceptual_pool_size: int = 4,
+                   vgg_multiscale: bool = False,
                    sinkhorn_mode: str = 'wflow', sinkhorn_tolerance: float = 1e-6,
                    sinkhorn_ot_epsilon: float | None = None) -> dict:
     """Backpropagate the chosen particle-field rule through the generator.
@@ -63,8 +67,29 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
     Softmax Riesz uses upstream's scaled, detached-goal regression loss.
     Only model parameters are optimized, never latents or output particles.
     """
+    if softmax_feature_space not in ('pixels', 'vgg'):
+        raise ValueError('Unknown softmax feature space')
+    if softmax_feature_space == 'vgg' and (feature_encoder is None or objective != 'softmax-riesz'
+                                          or multiscale_options is not None or target_options):
+        raise ValueError('VGG Riesz flow requires an encoder, softmax-riesz, and one feature-space field')
     optimizer.zero_grad(set_to_none=True)
     images = model(latent)
+    vgg_loss = None
+    if softmax_feature_space == "vgg":
+        if vgg_multiscale:
+            from perceptual import multiscale_vgg_loss
+            generated_features = feature_encoder.multiscale_features(images, perceptual_pool_size)
+            with torch.no_grad():
+                real_features = feature_encoder.multiscale_features(target.detach(), perceptual_pool_size)
+            vgg_loss = multiscale_vgg_loss(
+                generated_features, real_features, tau_list=tau_list,
+                normalize_per_temperature=normalize_per_temperature,
+                no_field_rms_normalization=no_field_rms_normalization,
+                repulsion_weight=repulsion_weight)
+        else:
+            images = feature_encoder.flow_features(images, perceptual_pool_size)
+            with torch.no_grad():
+                target = feature_encoder.flow_features(target.detach(), perceptual_pool_size)
     reference_images = None
     if objective == 'sinkhorn':
         if sinkhorn_latent is None:
@@ -72,31 +97,36 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
         with torch.no_grad():
             reference_images = model(sinkhorn_latent)
     diagnostics = {}
-    if multiscale_options is None and objective == 'sinkhorn':
+    loss = None
+    if vgg_loss is not None:
+        loss, diagnostics = vgg_loss
+    elif multiscale_options is None and objective == 'sinkhorn':
         if sinkhorn_mode == 'ot':
             loss, diagnostics = sinkhorn_ot_loss(images, target, reference_images,
                 iterations=sinkhorn_iters, tolerance=sinkhorn_tolerance, epsilon=sinkhorn_ot_epsilon)
         else:
             loss, diagnostics = sinkhorn_target_loss(
                 images, target, reference_images, epsilon=sinkhorn_epsilon, iterations=sinkhorn_iters)
-        loss.backward()
     elif multiscale_options is None and target_options:
         from target_updates import softmax_target_loss
         loss, diagnostics = softmax_target_loss(
             images, target, tau_list=tau_list,
             normalize_per_temperature=normalize_per_temperature,
-            no_field_rms_normalization=no_field_rms_normalization, **target_options)
-        loss.backward()
+            no_field_rms_normalization=no_field_rms_normalization,
+            repulsion_weight=repulsion_weight, **target_options)
     elif multiscale_options is None and objective == 'softmax-riesz' and no_field_rms_normalization:
         loss, info = _riesz_topk_softmax_loss_impl(
             images.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list,
             normalize_per_temperature=normalize_per_temperature,
-            no_field_rms_normalization=True, epsilon=1e-6)
-        loss.mean().backward()
-        diagnostics = raw_field_diagnostics(info)
+            no_field_rms_normalization=no_field_rms_normalization, epsilon=1e-6,
+            repulsion_weight=repulsion_weight)
+        loss = loss.mean()
+        if no_field_rms_normalization:
+            diagnostics = raw_field_diagnostics(info)
     elif multiscale_options is None:
         backpropagate_objective(images, target, chunk_size, objective=objective,
-                                tau_list=tau_list, normalize_per_temperature=normalize_per_temperature)
+                                tau_list=tau_list, normalize_per_temperature=normalize_per_temperature,
+                                repulsion_weight=repulsion_weight)
     else:
         loss, diagnostics = multiscale_loss(
             images, target, chunk_size=chunk_size, objective=objective,
@@ -104,9 +134,11 @@ def generator_step(model: torch.nn.Module, latent: torch.Tensor, target: torch.T
             target_options=target_options, reference_images=reference_images,
             sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
             no_field_rms_normalization=no_field_rms_normalization,
+            repulsion_weight=repulsion_weight,
             sinkhorn_mode=sinkhorn_mode, sinkhorn_tolerance=sinkhorn_tolerance,
             sinkhorn_ot_epsilon=sinkhorn_ot_epsilon,
             **multiscale_options)
+    if loss is not None:
         loss.backward()
     record_sinkhorn_diagnostics = objective == 'sinkhorn'
     if max_grad_norm or no_field_rms_normalization or record_sinkhorn_diagnostics:
@@ -219,6 +251,8 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument("--tau-list", type=float, nargs="+", default=[0.2, 0.05, 0.02])
     parser.add_argument("--normalize-per-temperature", action=argparse.BooleanOptionalAction,
                         default=True, help="Normalize each softmax field before summing")
+    parser.add_argument('--repulsion-weight', type=float, default=1.0,
+                        help='Softmax Riesz negative-force multiplier; attraction and distance scale stay fixed')
     parser.add_argument('--no-field-rms-normalization', action='store_true',
                         help='Bypass both softmax field RMS normalizations; retain batch-distance scaling')
     parser.add_argument("--chunk-size", type=int, default=64)
@@ -249,10 +283,17 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
     parser.add_argument('--lpips-weight', type=float, default=0.0,
                         help='Frozen VGG LPIPS weight for CIFAR reconstruction only')
     parser.add_argument('--lpips-cache', type=Path, default=None,
-                        help='Explicit pretrained-weight cache for perceptual priming')
+                        help='Explicit pretrained-weight cache for frozen VGG')
+    parser.add_argument('--softmax-feature-space', choices=['pixels', 'vgg'], default='pixels',
+                        help='Representation whose distances and directions define the softmax Riesz flow')
+    parser.add_argument('--perceptual-pool-size', type=int, default=4,
+                        help='Maximum spatial size per normalized VGG feature layer')
+    parser.add_argument('--vgg-multiscale', action='store_true',
+                        help='Separate VGG layer spatial, local-statistic and global-statistic fields')
     parser.add_argument("--init-checkpoint", type=Path, default=None,
                         help="Start a new distributional run from online weights and inherited EMA; fresh optimizer")
-    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--save-every", type=int, default=None,
+                        help='Snapshot/FID interval; default 5000 for CIFAR step training, otherwise 200')
     parser.add_argument("--save-snapshots", type=int, default=None,
                         help="Save this many evenly spaced intervals plus initialization; overrides save-every")
     parser.add_argument("--trajectory-particles", type=int, default=8,
@@ -287,6 +328,10 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         parser.error("invalid field step, noise levels, or checkpoint interval")
     if args.objective == 'drifting' and not args.normalize_per_temperature:
         parser.error('The official Drifting loss requires per-temperature normalization')
+    if not math.isfinite(args.repulsion_weight) or args.repulsion_weight < 0:
+        parser.error('--repulsion-weight must be finite and nonnegative')
+    if args.repulsion_weight != 1.0 and (args.objective != 'softmax-riesz' or args.training_stage != 'distributional'):
+        parser.error('--repulsion-weight requires distributional softmax-riesz')
     if args.no_field_rms_normalization:
         if args.objective != 'softmax-riesz' or args.training_stage != 'distributional':
             parser.error('--no-field-rms-normalization requires distributional softmax-riesz')
@@ -313,6 +358,17 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         parser.error('LPIPS is only supported for CIFAR reconstruction pretraining')
     if args.lpips_weight and args.lpips_cache is None:
         parser.error('--lpips-cache is required with positive --lpips-weight')
+    if args.perceptual_pool_size < 1:
+        parser.error('--perceptual-pool-size must be positive')
+    if args.vgg_multiscale and (args.softmax_feature_space != 'vgg' or not args.no_field_rms_normalization):
+        parser.error('--vgg-multiscale requires VGG features and --no-field-rms-normalization')
+    if args.softmax_feature_space == 'vgg':
+        if args.dataset != 'cifar10' or args.training_stage != 'distributional' or args.objective != 'softmax-riesz':
+            parser.error('VGG distances require CIFAR distributional softmax-riesz')
+        if args.lpips_cache is None:
+            parser.error('--lpips-cache is required for VGG distances')
+        if args.multiscale_loss or args.field_step != 1 or args.noise_levels != [0.0]:
+            parser.error('VGG flow uses one feature embedding; disable pixel multiscale and target-update options')
     if args.init_checkpoint and args.training_stage != 'distributional':
         parser.error('--init-checkpoint is for distributional post-training')
     if args.output is None:
@@ -343,6 +399,8 @@ def parse_args(default_dataset: str = "cifar10") -> argparse.Namespace:
         parser.error('Distributional view/noise options do not apply to reconstruction')
     if args.steps is None and args.epochs is None:
         args.steps = 2000
+    if args.save_every is None:
+        args.save_every = 5000 if args.dataset == 'cifar10' and args.epochs is None else 200
     for key in ("particles", "eval_size", "chunk_size", "save_every", "threads", "trajectory_particles", "latent_dim", "base_channels", "num_res_blocks"):
         if getattr(args, key) <= 0:
             parser.error(f"--{key.replace('_', '-')} must be positive")
@@ -426,7 +484,7 @@ def main(default_dataset: str = "cifar10") -> None:
         initialization = initialize_from_checkpoint(model, ema_model, args.init_checkpoint, args)
     evaluation_model = ema_model if ema_model is not None else model
     perceptual_loss = None
-    if args.lpips_weight:
+    if args.lpips_weight or args.softmax_feature_space == "vgg":
         from perceptual import VGGPerceptualLoss
         perceptual_loss = VGGPerceptualLoss(args.lpips_cache, device)
     x = evaluation_images(evaluation_model, eval_latent)
@@ -502,19 +560,42 @@ def main(default_dataset: str = "cifar10") -> None:
                       view_distance_scaling="upstream_batch_distance_scale" if args.objective in ('softmax-riesz', 'sinkhorn', 'drifting')
                       else "euclidean_distance_divided_by_sqrt_view_dimension",
                       training_loss_diagnostic="mean_over_updates_in_iteration_gradient_surrogates_not_mmd_energy")
+    if args.softmax_feature_space == "vgg":
+        config.update(distributional_perceptual={
+            **perceptual_loss.metadata,
+            'objective': 'single_softmax_riesz_flow_in_concatenated_vgg_features',
+            'layers': ['relu1_2', 'relu2_2', 'relu3_3', 'relu4_3', 'relu5_3'],
+            'features': 'LPIPS_channel_normalization_then_adaptive_average_pool',
+            'layer_scaling': 'divide_each_layer_by_sqrt_spatial_area_and_sqrt_layer_count',
+            'maximum_spatial_size': args.perceptual_pool_size,
+            'learned_lpips_pairwise_heads': False,
+            'pairing': 'unpaired_distributions', 'target_features': 'detached',
+            'distance': 'euclidean_distance_in_concatenated_features',
+            'additional_supervision': False})
+        if args.vgg_multiscale:
+            config['distributional_perceptual'].update(
+                objective='mean_of_15_independent_softmax_riesz_feature_fields',
+                features='channel_normalized_VGG_spatial_and_local_and_global_statistics',
+                layer_scaling='independent_batch_distance_scale_per_branch',
+                distance='euclidean_distance_with_independent_neighbors_per_branch',
+                branch_weighting='equal_layers_and_equal_three_branches_per_layer',
+                local_statistics='2x2_nonoverlapping_mean_and_std_then_pool_to_at_most_4x4',
+                global_statistics='channel_mean_and_std',
+                statistics_epsilon=1e-8)
     if args.objective == "softmax-riesz":
         source_path = Path(__file__).with_name("loss.py")
         config.update(softmax_source_repository="https://github.com/hudsonchen/riesz_flow_hudson",
                       softmax_source_revision="777d696f31340a1370f5b39a2e7d000464b10526",
                       softmax_module_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
                       softmax_epsilon=1e-6, softmax_direction_epsilon=1e-8,
-                      softmax_rms_epsilon=1e-8, softmax_feature_space="raw_pixels",
+                      softmax_rms_epsilon=1e-8, softmax_feature_space=args.softmax_feature_space,
                       softmax_numerics='direct_pairwise_differences', softmax_query_chunk=32,
-                      softmax_fixed_negatives=False,
+                      softmax_fixed_negatives=False, softmax_repulsion_weight=args.repulsion_weight,
+                      softmax_repulsion_scaling='negative_fields_only_before_field_normalization',
                       softmax_field_normalization=('none' if args.no_field_rms_normalization else
                                                    'per_temperature' if args.normalize_per_temperature else 'combined'),
-                      velocity_diagnostic=('raw_field_in_scaled_pixel_space' if args.no_field_rms_normalization
-                                           else 'normalized_field_in_scaled_pixel_space'))
+                      velocity_diagnostic=(f'raw_field_in_scaled_{args.softmax_feature_space}_space' if args.no_field_rms_normalization
+                                           else f'normalized_field_in_scaled_{args.softmax_feature_space}_space'))
         if args.no_field_rms_normalization:
             config.update(training_diagnostics_file='training_diagnostics.csv',
                           training_diagnostics_aggregation='arithmetic mean across active views, then updates in each logged interval',
@@ -600,7 +681,8 @@ def main(default_dataset: str = "cifar10") -> None:
             raise ValueError('Resume requires the original output directory and config.json')
         checkpoint = torch.load(restore_path, map_location='cpu', weights_only=False)
         if perceptual_loss is not None:
-            previous_perceptual = checkpoint['config'].get('reconstruction_perceptual', {})
+            previous_perceptual = checkpoint['config'].get(
+                'distributional_perceptual' if args.softmax_feature_space == 'vgg' else 'reconstruction_perceptual', {})
             if previous_perceptual.get('weights_sha256') != perceptual_loss.metadata['weights_sha256']:
                 raise ValueError('Resume perceptual weights mismatch')
         if 'priming_initialization' in checkpoint['config']:
@@ -611,12 +693,16 @@ def main(default_dataset: str = "cifar10") -> None:
                        'schedule_start_update', 'warmup_steps', 'train_particles', 'random_flip',
                        'max_grad_norm', 'ema_decay', 'crops_per_size', 'global_loss_weight',
                        'coarse_loss_weight', 'patch_loss_weight'}
+        tuning_keys |= {'target_batch_size', 'vgg_multiscale', 'perceptual_pool_size', 'lpips_cache'}
         if args.fork_checkpoint:
             ignored |= tuning_keys
             if checkpoint['arguments'].get('training_stage', 'distributional') != 'distributional':
                 raise ValueError('Tuned continuation requires a distributional checkpoint')
-            if args.schedule_start_update != checkpoint['update_count']:
-                raise ValueError('Fork schedule must start at the source checkpoint update')
+            same_schedule = all(checkpoint['arguments'].get(key) == getattr(args, key)
+                                for key in ('learning_rate', 'lr_schedule', 'min_learning_rate',
+                                            'schedule_start_update', 'warmup_steps', 'steps', 'epochs'))
+            if args.schedule_start_update != checkpoint['update_count'] and not same_schedule:
+                raise ValueError('Fork must preserve the source schedule or start at the source checkpoint update')
             config['tuning_initialization'] = dict(
                 checkpoint=str(restore_path.resolve()), source_update=checkpoint['update_count'],
                 inherited_optimizer=True, inherited_ema=True,
@@ -631,10 +717,11 @@ def main(default_dataset: str = "cifar10") -> None:
                                warmup_steps=0, max_grad_norm=0.0, training_stage='distributional',
                                corruption_level=0.8, init_checkpoint=None, train_particles=None,
                                random_flip=False, lr_schedule='constant', min_learning_rate=0.0,
-                               schedule_start_update=0, no_field_rms_normalization=False,
+                               schedule_start_update=0, no_field_rms_normalization=False, repulsion_weight=1.0,
                                sinkhorn_mode='wflow', sinkhorn_tolerance=1e-6,
                                dit_width=384, dit_depth=12, dit_heads=6, dit_patch_size=2,
-                               lpips_weight=0.0, lpips_cache=None)
+                               lpips_weight=0.0, lpips_cache=None,
+                               softmax_feature_space="pixels", perceptual_pool_size=4, vgg_multiscale=False)
         for key, value in vars(args).items():
             value = str(value) if isinstance(value, Path) else value
             if key == ('epochs' if unit == 'epoch' else 'steps'):
@@ -743,6 +830,10 @@ def main(default_dataset: str = "cifar10") -> None:
                 multiscale_options=multiscale_options, target_options=target_options,
                 sinkhorn_latent=sinkhorn_latent, sinkhorn_epsilon=args.sinkhorn_epsilon,
                 sinkhorn_iters=args.sinkhorn_iters, max_grad_norm=args.max_grad_norm,
+                repulsion_weight=args.repulsion_weight,
+                feature_encoder=perceptual_loss, softmax_feature_space=args.softmax_feature_space,
+                perceptual_pool_size=args.perceptual_pool_size,
+                vgg_multiscale=args.vgg_multiscale,
                 no_field_rms_normalization=args.no_field_rms_normalization,
                 sinkhorn_mode=args.sinkhorn_mode, sinkhorn_tolerance=args.sinkhorn_tolerance,
                 sinkhorn_ot_epsilon=args.sinkhorn_ot_epsilon)
@@ -804,12 +895,27 @@ def main(default_dataset: str = "cifar10") -> None:
                 train_mmd = mmd_squared(x, eval_train, train_yy, args.chunk_size)
                 test_mmd = mmd_squared(x, heldout, test_yy, args.chunk_size)
                 # Report the velocity on the fixed evaluation target, separately from MMD.
-                if args.objective == "softmax-riesz":
+                if args.objective == "softmax-riesz" and args.vgg_multiscale:
+                    from perceptual import multiscale_vgg_loss
                     with torch.no_grad():
+                        _, info = multiscale_vgg_loss(
+                            perceptual_loss.multiscale_features(x, args.perceptual_pool_size),
+                            perceptual_loss.multiscale_features(eval_train, args.perceptual_pool_size),
+                            tau_list=args.tau_list, normalize_per_temperature=args.normalize_per_temperature,
+                            no_field_rms_normalization=args.no_field_rms_normalization,
+                            repulsion_weight=args.repulsion_weight)
+                    speed = info['raw_force_rms'].item()
+                elif args.objective == "softmax-riesz":
+                    with torch.no_grad():
+                        field_x, field_y = x, eval_train
+                        if args.softmax_feature_space == 'vgg':
+                            field_x = perceptual_loss.flow_features(x, args.perceptual_pool_size)
+                            field_y = perceptual_loss.flow_features(eval_train, args.perceptual_pool_size)
                         _, info = _riesz_topk_softmax_loss_impl(
-                            x.unsqueeze(0), eval_train.unsqueeze(0), tau_list=args.tau_list,
+                            field_x.unsqueeze(0), field_y.unsqueeze(0), tau_list=args.tau_list,
                             normalize_per_temperature=args.normalize_per_temperature, epsilon=1e-6,
-                            no_field_rms_normalization=args.no_field_rms_normalization)
+                            no_field_rms_normalization=args.no_field_rms_normalization,
+                            repulsion_weight=args.repulsion_weight)
                     speed = info["riesz_topk_softmax_velocity_rms"].item()
                 elif args.objective == 'drifting':
                     with torch.no_grad():

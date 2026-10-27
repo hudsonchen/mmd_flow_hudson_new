@@ -23,7 +23,7 @@ case "$stage" in
     posttraining|baseline)
         stage_args=(--steps 250000 --target-batch-size 256 --ema-decay 0.999
             --multiscale-loss --coarse-sizes 8 16 --patch-sizes 7 14
-            --save-every 2500 --checkpoint-every 1000)
+            --save-every 5000 --checkpoint-every 1000)
         if [[ "$stage" == posttraining ]]; then
             stage_args+=(--init-checkpoint "$study/reconstruction/checkpoint_latest.pt")
         fi ;;

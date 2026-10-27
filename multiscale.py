@@ -8,7 +8,7 @@ from loss import _riesz_topk_softmax_loss_impl, velocity, drifting_loss, sinkhor
 def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
                         normalize_per_temperature, target_options=None,
                         reference=None, sinkhorn_epsilon=0.05, sinkhorn_iters=10,
-                        diagnostics=None, no_field_rms_normalization=False,
+                        diagnostics=None, no_field_rms_normalization=False, repulsion_weight=1.0,
                         sinkhorn_mode="wflow", sinkhorn_tolerance=1e-6, sinkhorn_ot_epsilon=None):
     target = target.detach()
     if objective == 'sinkhorn':
@@ -32,7 +32,8 @@ def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
             value, info = softmax_target_loss(
                 features, target, tau_list=tau_list,
                 normalize_per_temperature=normalize_per_temperature,
-                no_field_rms_normalization=no_field_rms_normalization, **target_options)
+                no_field_rms_normalization=no_field_rms_normalization,
+                repulsion_weight=repulsion_weight, **target_options)
             if diagnostics is not None:
                 for name, result in info.items():
                     diagnostics.setdefault(name, []).append(result)
@@ -41,7 +42,8 @@ def objective_surrogate(features, target, chunk_size, *, objective, tau_list,
         value, info = _riesz_topk_softmax_loss_impl(
             features.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list,
             normalize_per_temperature=normalize_per_temperature, epsilon=1e-6,
-            no_field_rms_normalization=no_field_rms_normalization)
+            no_field_rms_normalization=no_field_rms_normalization,
+            repulsion_weight=repulsion_weight)
         if diagnostics is not None and no_field_rms_normalization:
             from loss import raw_field_diagnostics
             for name, result in raw_field_diagnostics(info).items():
@@ -63,7 +65,7 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                     global_weight=1.0, coarse_weight=1.0, patch_weight=1.0,
                     target_options=None, reference_images=None,
                     sinkhorn_epsilon=0.05, sinkhorn_iters=10,
-                    no_field_rms_normalization=False, sinkhorn_mode="wflow", sinkhorn_tolerance=1e-6,
+                    no_field_rms_normalization=False, repulsion_weight=1.0, sinkhorn_mode="wflow", sinkhorn_tolerance=1e-6,
                     sinkhorn_ot_epsilon=None):
     """Return a weighted loss and detached group diagnostics.
 
@@ -96,6 +98,7 @@ def multiscale_loss(images, target, image_shape, chunk_size, *,
                                    sinkhorn_epsilon=sinkhorn_epsilon, sinkhorn_iters=sinkhorn_iters,
                                    diagnostics=diagnostics,
                                    no_field_rms_normalization=no_field_rms_normalization,
+                                   repulsion_weight=repulsion_weight,
                                    sinkhorn_mode=sinkhorn_mode, sinkhorn_tolerance=sinkhorn_tolerance,
                                    sinkhorn_ot_epsilon=sinkhorn_ot_epsilon)
 

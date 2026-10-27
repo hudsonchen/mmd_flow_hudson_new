@@ -90,6 +90,7 @@ def _riesz_topk_softmax_loss_impl(
     direction_epsilon: float = 1e-8,
     normalize_per_temperature: bool = False,
     no_field_rms_normalization: bool = False,
+    repulsion_weight: float = 1.0,
     return_field: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Regress toward the detached, RMS-normalized softmax Riesz velocity.
@@ -103,6 +104,8 @@ def _riesz_topk_softmax_loss_impl(
     With ``normalize_per_temperature``, each temperature field is instead
     divided by its own RMS before summation, as in Drifting. This mode uses
     Drifting's squared-RMS floor of ``1e-8`` and no final normalization.
+    repulsion_weight multiplies both negative fields without changing the
+    batch-distance scale or attraction.
     With no_field_rms_normalization, neither field RMS normalization is applied;
     batch-distance coordinate scaling and softmax temperatures are unchanged.
     The legacy total-field RMS floor is applied after the square root. Target
@@ -148,6 +151,9 @@ def _riesz_topk_softmax_loss_impl(
     for name, value, shape in expected_shapes:
         if value.shape != shape:
             raise ValueError(f"{name} must have shape {tuple(shape)}")
+
+    if not math.isfinite(repulsion_weight) or repulsion_weight < 0:
+        raise ValueError("repulsion_weight must be finite and nonnegative")
 
     gen = gen.float()
     fixed_pos = fixed_pos.detach().float()
@@ -208,8 +214,8 @@ def _riesz_topk_softmax_loss_impl(
                 direction_epsilon,
             )
             temperature_attraction = toward_pos / float(temperature)
-            temperature_self_repulsion = -toward_gen / float(temperature)
-            temperature_fixed_negative = -toward_neg / float(temperature)
+            temperature_self_repulsion = -toward_gen / float(temperature) * repulsion_weight
+            temperature_fixed_negative = -toward_neg / float(temperature) * repulsion_weight
             temperature_field = (
                 temperature_attraction
                 + temperature_self_repulsion
@@ -340,7 +346,8 @@ def mmd_squared(x: torch.Tensor, y: torch.Tensor, yy: float, chunk_size: int) ->
 
 
 def backpropagate_objective(images, target, chunk_size, *, objective="riesz",
-                            tau_list=(0.2, 0.05, 0.02), normalize_per_temperature=True):
+                            tau_list=(0.2, 0.05, 0.02), normalize_per_temperature=True,
+                            repulsion_weight=1.0):
     """Apply the chosen image-output gradient without changing its scaling."""
     if objective == "drifting":
         loss, _ = drifting_loss(images.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list)
@@ -348,7 +355,8 @@ def backpropagate_objective(images, target, chunk_size, *, objective="riesz",
     elif objective == "softmax-riesz":
         loss, _ = _riesz_topk_softmax_loss_impl(
             images.unsqueeze(0), target.unsqueeze(0), tau_list=tau_list,
-            normalize_per_temperature=normalize_per_temperature, epsilon=1e-6)
+            normalize_per_temperature=normalize_per_temperature, epsilon=1e-6,
+            repulsion_weight=repulsion_weight)
         loss.mean().backward()
     elif objective == "riesz":
         images.backward(-velocity(images.detach(), target, chunk_size) / len(images))
