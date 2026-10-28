@@ -5,8 +5,8 @@ import tempfile
 from pathlib import Path
 import unittest
 import torch
-from backbone import CIFAR10DiTParticleGenerator
-from reference_dit import ReferenceDiT,initialize_from_reconstruction,verified_reconstruction_checkpoint
+from backbone import CIFAR10DiTParticleGenerator, CIFAR10UNetParticleGenerator
+from reference_dit import ReferenceDiT,ReferenceDDPMUNet,image_base_from_config,initialize_from_reconstruction,verified_reconstruction_checkpoint
 from small_flow import DenoiserVelocity,sample,validate_riesz_parent
 
 
@@ -14,6 +14,33 @@ class ReferenceDiTTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
+
+    def test_diffusion_unet_adapter_preserves_backbone_and_time_conditioning(self):
+        diffusion=CIFAR10UNetParticleGenerator(16,1,time_conditioned=True).eval()
+        with torch.no_grad():
+            diffusion.output[2].weight.normal_(0,.02)
+        flow=ReferenceDDPMUNet(16,1).eval()
+        flow.load_state_dict(diffusion.state_dict(),strict=True)
+        x=torch.randn(2,3072)
+        for t in [0.,.5,.999,torch.tensor([.2,.8])]:
+            time=torch.as_tensor(t).expand(2)
+            expected=diffusion(x,(1-time)*999).flatten(1)
+            torch.testing.assert_close(flow(x,t),expected,rtol=0,atol=0)
+        prediction=sample(DenoiserVelocity(flow),x,3,'euler')
+        self.assertEqual(prediction.shape,x.shape)
+        prediction.square().mean().backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in flow.parameters()))
+        self.assertGreater(float(flow.time_mlp[0].weight.grad.abs().sum()),0.)
+
+    def test_diffusion_unet_factory_matches_full_diffusion_parameterization(self):
+        with torch.device('meta'):
+            flow=image_base_from_config(dict(architecture='ddpm-unet',dataset='cifar10'))
+            diffusion=CIFAR10UNetParticleGenerator(128,4,time_conditioned=True)
+        self.assertEqual(sum(p.numel() for p in flow.parameters()),61804419)
+        self.assertEqual({k:tuple(v.shape) for k,v in flow.state_dict().items()},
+                         {k:tuple(v.shape) for k,v in diffusion.state_dict().items()})
+        with self.assertRaises(ValueError):
+            image_base_from_config(dict(architecture='ddpm-unet',dataset='mnist'))
 
     def checkpoint(self, path):
         torch.manual_seed(19)

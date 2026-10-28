@@ -120,7 +120,7 @@ def main():
     p.add_argument('--batch',type=int,default=128)
     p.add_argument('--target-batch',type=int)
     p.add_argument('--width',type=int,default=32)
-    p.add_argument('--architecture',choices=['unet','dit'],default='unet')
+    p.add_argument('--architecture',choices=['unet','dit','ddpm-unet'],default='unet')
     p.add_argument('--dit-width',type=int,default=384)
     p.add_argument('--dit-depth',type=int,default=12)
     p.add_argument('--dit-heads',type=int,default=6)
@@ -355,7 +355,7 @@ def main():
             normalization=args.normalization,affinity=args.affinity))
         write_json(output/'config.json',{k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()})
     reference=copy.deepcopy(model).requires_grad_(False) if args.fork else None
-    ema=copy.deepcopy(model).requires_grad_(False)
+    ema=copy.deepcopy(model).eval().requires_grad_(False)
     optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
     # Actual model forward/backward preflight before updates.
     model(train[:2],.5).square().mean().backward()

@@ -1,5 +1,38 @@
 # CIFAR-10 priming on LSF
 
+## Distributed flow matching with the diffusion U-Net
+
+`launch_cifar_fm_ddp.py --name NAME --submit` creates a frozen experiment in
+project CIFAR storage, pins the Meta `facebookresearch/flow_matching` recipe
+references to a Git commit, runs the mathematical tests, and submits a four-GPU
+preflight followed by training on `longgpu01` / `longgpu`. The model is the exact
+61,804,419-parameter time-conditioned DDPM U-Net, predicting unrestricted velocity
+from random weights. All four RTX 2080 Ti GPUs train one synchronized DDP model.
+The default global batch is 256: two FP16 microbatches of 32 on each GPU, with
+FP32 optimizer states and loss, gradient scaling, and norm clipping at 1.
+
+The adapted Meta CIFAR recipe uses independent Gaussian/data coupling,
+`t = sigmoid(1.2 - 1.2 * Normal(0,1))`, AdamW at 1e-4 with betas (0.9, 0.95),
+weight decay 0.01, and warm-started EMA capped at 0.999. The DDPM backbone retains
+dropout 0.1 and maps time to `999*(1-t)`. It is not Meta's published architecture
+or a claim to reproduce its 2.07 FID. The initial budget is 250,000 updates.
+
+Sampling uses 50 second-order Heun intervals (100 actual network calls) on an
+EDM-derived rho=7 time grid with exact noise/data endpoints. FID-10K against all
+50,000 training images runs every 5,000 updates and previews every 1,000.
+At update 5,000, a separate 100-interval audit checks integration sensitivity;
+final evaluation also audits 100 and 250 intervals. FID keeps the existing local
+unquantized-pixel protocol. Training and FID generation are distributed over all
+four GPUs; Inception moments are combined in float64.
+
+The preflight exercises full-sized updates, verifies parameter equality between
+ranks, tests the actual sampler and Inception, records per-GPU peak memory, and
+checks checkpoint serialization. Atomic `latest.pt` checkpoints include model,
+EMA, optimizer, GradScaler, update count, and each rank's CPU/CUDA RNG. Resume
+the frozen recorded command with `--resume TRAINING/latest.pt` and otherwise
+identical settings. Checkpoints are written before evaluation and best models
+are retained. The preflight checkpoint is never used to initialize training.
+
 ## Multiscale VGG DiT continuation
 
 Add `--restart-from-priming` and provide a completed reconstruction checkpoint
@@ -410,6 +443,17 @@ assigned a `2g.35gb` partition. The full-size request was assigned `7/7` by LSF.
 Use `--smoke` before training to verify the visible device, finite gradients,
 memory and runtime. `--exclusive` is for non-MIG compute mode and cannot be
 combined with `--gpu-mig`. Default launcher placement remains the 2080 Ti host.
+
+For the CIFAR Riesz comparison against the diffusion backbone, use
+`--architecture ddpm-unet --parameterization denoiser`. This selects the exact
+61,804,419-parameter diffusion U-Net (base channels 128, four residual blocks
+per level), with the same layers, attention, dropout 0.1, time embedding, and
+unrestricted output head. The adapter only flattens its output and maps flow
+time `t` to embedding coordinate `999*(1-t)`; the reference path remains linear.
+The head predicts centered clean pixels instead of epsilon, and no diffusion
+weights are loaded. EMA evaluation disables dropout. The small `unet` option
+remains a different architecture and must not be described as the diffusion
+backbone. Run a full-batch GPU preflight before this larger training job.
 
 For a cheaper reference-process candidate, `--smoke --local-only
 --local-diagnostics 4 --affinity row-column --feature-space pixels` compares

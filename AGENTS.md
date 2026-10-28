@@ -18,6 +18,15 @@ For new experiment jobs, benchmark FID every 5,000 optimizer updates by default.
 Preserve existing runs' recorded schedules unless the user requests a change.
 The ten-step time-conditioned Riesz run was explicitly switched to this cadence.
 
+# CIFAR Riesz U-Net comparison
+
+The user clarified on 2026-10-27 that the CIFAR Riesz U-Net run must use the
+same backbone as the diffusion baseline: `CIFAR10UNetParticleGenerator` with
+base channels 128, four residual blocks per level, time conditioning, and
+61,804,419 parameters. Use `--architecture ddpm-unet`; do not substitute the
+small `ImageVelocity` U-Net. Train from random weights with the Riesz objective,
+without loading diffusion weights.
+
 # Small experiment hardware
 
 Prefer RTX 2080 Ti GPUs for small experiments such as Gaussian-mixture

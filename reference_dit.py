@@ -4,6 +4,23 @@ from pathlib import Path
 
 import torch
 from flow_path import TimeConditionedDiT
+from backbone import CIFAR10UNetParticleGenerator
+
+
+class ReferenceDDPMUNet(CIFAR10UNetParticleGenerator):
+    """Exact diffusion backbone, adapted to flattened flow states and flow time.
+
+    Flow t=0 is noise and t=1 is data. Map to the diffusion embedding's
+    999-to-0 noise-time range; this is a time coordinate, not a DDPM noise
+    schedule. The unrestricted head predicts clean pixels for Riesz training.
+    No layers, parameters, or pretrained diffusion weights are added.
+    """
+    def __init__(self, base_channels=128, num_res_blocks=4):
+        super().__init__(base_channels, num_res_blocks, time_conditioned=True)
+
+    def forward(self, state, time):
+        time = torch.as_tensor(time, device=state.device, dtype=state.dtype).expand(len(state))
+        return super().forward(state, (1 - time) * 999).flatten(1)
 
 
 class ReferenceDiT(TimeConditionedDiT):
@@ -19,6 +36,10 @@ class ReferenceDiT(TimeConditionedDiT):
 
 def image_base_from_config(config):
     architecture = config.get('architecture', 'unet')
+    if architecture == 'ddpm-unet':
+        if config['dataset'] != 'cifar10' or config.get('feature_space', 'pixels') != 'pixels':
+            raise ValueError('Diffusion U-Net reference flows require CIFAR-10 pixel space')
+        return ReferenceDDPMUNet()
     if architecture == 'unet':
         from small_flow import ImageVelocity, image_geometry
         shape = image_geometry(config['dataset'])

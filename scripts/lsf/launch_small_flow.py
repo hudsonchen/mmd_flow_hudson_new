@@ -18,6 +18,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--name', required=True)
     p.add_argument('--walltime', default='02:00')
+    p.add_argument('--dependency-job', help='Start only after this LSF job completes successfully (GPU preflight)')
     p.add_argument('--queue',default='longgpu')
     p.add_argument('--host',default='longgpu01')
     p.add_argument('--gpu-memory',type=int,help='Requested GPU memory in GB')
@@ -31,6 +32,8 @@ def main():
     p.add_argument('--smoke', action='store_true')
     p.add_argument('--gradient-diagnostic', action='store_true')
     args, extra = p.parse_known_args()
+    if args.dependency_job is not None and not re.fullmatch(r'[1-9][0-9]*',args.dependency_job):
+        p.error('--dependency-job must be a positive LSF job ID')
     if args.cpus<1 or args.memory_gb<1 or (args.gpu_memory is not None and args.gpu_memory<1):p.error('Resource requests must be positive')
     if args.gpu_mig and args.exclusive:p.error('MIG instances require shared compute mode; omit --exclusive')
     if sum([args.audit,args.smoke,args.gradient_diagnostic])>1:p.error('Choose only one audit, smoke, or gradient diagnostic mode')
@@ -101,6 +104,7 @@ def main():
         else 'paired' if '--objective' in extra and extra[extra.index('--objective')+1]=='coupled' else 'independent')
     manifest = dict(created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),command=command,
         hashes=hashes,queue=args.queue,host=args.host,cpus=args.cpus,memory_gb=args.memory_gb,gpu_memory=args.gpu_memory,gpu_mig=args.gpu_mig,
+        dependency_job=args.dependency_job,
         outside_definition='distance to nearest center > 3*0.12',
         dataset=args.dataset,reference='affine Gaussian-to-data path',
         reference_particle_coupling='recorded per checkpoint' if args.audit else coupling,
@@ -111,7 +115,8 @@ def main():
     gpu='num=1:mode='+('exclusive_process' if args.exclusive else 'shared')
     if args.gpu_memory:gpu+=f':gmem={args.gpu_memory}G'
     if args.gpu_mig:gpu+=f':mig={args.gpu_mig}'
-    result = subprocess.run(['bsub','-q',args.queue,'-m',args.host,'-J','small_reference_flow',
+    dependency=['-w',f'done({args.dependency_job})'] if args.dependency_job else []
+    result = subprocess.run(['bsub','-q',args.queue,'-m',args.host,'-J','small_reference_flow',*dependency,
         '-n',str(args.cpus),'-R',f'span[hosts=1] rusage[mem={args.memory_gb}GB]','-gpu',gpu,
         '-W',args.walltime,'-oo',str(study/'scheduler.log'),*command],text=True,capture_output=True,check=True)
     (study/'submission.json').write_text(json.dumps(dict(stdout=result.stdout,stderr=result.stderr,

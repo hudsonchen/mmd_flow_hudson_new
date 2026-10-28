@@ -23,7 +23,7 @@ def main():
     p.add_argument('--dataset',choices=['mnist','fashionmnist','cifar10'],default='mnist')
     p.add_argument('--batch',type=int,default=128)
     p.add_argument('--width',type=int,default=32)
-    p.add_argument('--architecture',choices=['unet','dit'],default='unet')
+    p.add_argument('--architecture',choices=['unet','dit','ddpm-unet'],default='unet')
     p.add_argument('--dit-width',type=int,default=384)
     p.add_argument('--dit-depth',type=int,default=12)
     p.add_argument('--dit-heads',type=int,default=6)
