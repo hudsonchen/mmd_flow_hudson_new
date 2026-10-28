@@ -1,8 +1,8 @@
 """Direct-velocity CIFAR Riesz training with global detached particle fields."""
 import math
 import torch
-from cifar_flow_matching import DDPMFlow, skewed_times
-from small_flow import riesz_loss
+from velocity_model import skewed_times
+from riesz_loss import riesz_loss
 
 
 def training_time(device, policy='skewed', generator=None):
@@ -30,15 +30,16 @@ def global_particle_loss(local_prediction, predictions, targets, rank, time, hor
     population = [x.detach() for x in predictions]
     population[rank] = local_prediction
     loss, info = riesz_loss(torch.cat(population).flatten(1), torch.cat(targets).detach().flatten(1),
-        taus=taus, normalization='none', affinity='row-column', include_self_negative=True,
-        distance_powers=powers)
+        taus=taus, distance_powers=powers)
     h = min(horizon, 1-time)
     return loss * (1-time)**time_power / h, info
 
 
 @torch.inference_mode()
-def sample_velocity(model, noise, steps=100, amp=False):
-    """Uniform Euler sampling; direct velocity is defined at both endpoints."""
+def sample_velocity(model, noise, steps=100, amp=False, solver='euler'):
+    """Uniform Euler or Heun; Heun uses two network evaluations per interval."""
+    if solver not in ('euler', 'heun') or steps < 1:
+        raise ValueError('Expected Euler/Heun and a positive interval count')
     previous_mode = model.training
     model.eval()
     x = noise.float().clone()
@@ -47,6 +48,10 @@ def sample_velocity(model, noise, steps=100, amp=False):
             t = x.new_tensor(k/steps)
             with torch.autocast('cuda', dtype=torch.float16, enabled=amp):
                 velocity = model(x, t).float()
+                if solver == 'heun':
+                    endpoint = x.new_tensor((k+1)/steps)
+                    second = model(x + velocity/steps, endpoint).float()
+                    velocity = .5*(velocity+second)
             x = x + velocity/steps
         if not torch.isfinite(x).all():
             raise RuntimeError('Nonfinite direct-velocity samples')

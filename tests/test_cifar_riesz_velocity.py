@@ -1,11 +1,10 @@
 """Verify global Riesz gradients survive partitioning and direct velocity sampling."""
-import os
-os.environ['DRIFT_COMPILE']='0'
 import copy
+import math
 import unittest
 import torch
 from cifar_riesz_velocity import global_particle_loss, training_time, sample_velocity
-from small_flow import coupled_reference_loss
+from riesz_loss import riesz_loss
 
 
 class RieszVelocityTests(unittest.TestCase):
@@ -20,12 +19,13 @@ class RieszVelocityTests(unittest.TestCase):
         clean,noise=torch.randn(16,6),torch.randn(16,6)
         # Include a shortened endpoint interval and both weighting choices.
         for time in [.1,.77,.999]:
-            for time_power in [0.,1.]:
+            for time_power in [0.,.5,1.]:
                 model.zero_grad()
-                expected=coupled_reference_loss(model,clean,noise,time,.01,
-                    taus=(.2,.05,.02),normalization='none',affinity='row-column',
-                    distance_powers=(.8,1.,1.5),include_self_negative=True,
-                    time_weight_power=time_power)
+                h=min(.01,1-time)
+                source=(1-time)*noise+time*clean
+                target=(1-time-h)*noise+(time+h)*clean
+                expected=riesz_loss(source+h*model(source,time),target,
+                    taus=(.2,.05,.02),distance_powers=(.8,1.,1.5))[0]*(1-time)**time_power/h
                 expected.backward()
                 reference=[p.grad.clone() for p in model.parameters()]
                 h=min(.01,1-time)
@@ -60,6 +60,29 @@ class RieszVelocityTests(unittest.TestCase):
         torch.testing.assert_close(model(x,torch.tensor(1.)),torch.full_like(x,2.))
         torch.testing.assert_close(sample_velocity(model,x,100),x+2,atol=1e-5,rtol=1e-5)
         self.assertTrue(model.training)
+
+    def test_heun_accuracy_and_call_count(self):
+        class Exponential(torch.nn.Module):
+            def __init__(self):super().__init__();self.times=[]
+            def forward(self,x,t):self.times.append(float(t));return x
+        model=Exponential().train()
+        noise=torch.ones(2,3,2,2)
+        actual=sample_velocity(model,noise,50,solver='heun')
+        self.assertEqual(len(model.times),100)
+        self.assertEqual((min(model.times),max(model.times)),(0.,1.))
+        self.assertLess(float((actual-math.e).abs().max()),.0002)
+        self.assertTrue(model.training)
+        euler=sample_velocity(model,noise,100)
+        self.assertLess(float((actual-math.e).abs().max()),float((euler-math.e).abs().max())/10)
+
+    def test_evaluation_only_resume_rejects_training_changes(self):
+        from scripts.lsf.run_cifar_riesz_ddp import validate_resume_config
+        saved=dict(output='old',sample_steps=100,sampling='old',reference_time_power=1.,world_size=4)
+        new=dict(saved,output='new',sample_steps=50,sampling='new',solver='heun',required_gpu='RTX 2080 Ti')
+        self.assertTrue(validate_resume_config(saved,new,True))
+        with self.assertRaises(ValueError):validate_resume_config(saved,new)
+        for change in [dict(reference_time_power=.5),dict(world_size=1),dict(lr=.001)]:
+            with self.assertRaises(ValueError):validate_resume_config(saved,dict(new,**change),True)
 
 
 if __name__=='__main__':unittest.main()

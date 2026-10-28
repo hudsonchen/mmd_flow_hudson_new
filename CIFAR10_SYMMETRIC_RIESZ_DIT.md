@@ -2,7 +2,55 @@
 
 This document describes the four-GPU velocity Riesz experiment launched on
 2026-10-28. It replaces the earlier CIFAR-10 DiT/denoiser progress report.
-The setup below is taken from this run's saved configuration and frozen source.
+The original setup below is taken from this run's saved configuration and frozen
+source. The following section records the later time-weight ablation and sampler
+change; the original Euler setup is retained as historical context.
+
+## Time-weight ablation and Heun evaluation — 2026-10-28
+
+The new experiment compares `L = (1-t)^gamma / h * L_Riesz` for exponents
+**1, 0.5, and 0**. All three runs start from random seed-0 weights, use the same
+61.8M-parameter velocity U-Net, one GPU/rank, global batch 256, skewed times,
+distance powers 0.8/1.0/1.5 without field RMS normalization, Adam peak learning
+rate `2e-4`, and a 100,000-update budget. Within this trio, the intended training
+change is the time-weight exponent. The exponent-1 control uses an H200 3g MIG
+partition because full partitions were occupied; the two ablations use H200 7g
+partitions. Compare quality at matched updates, not elapsed time. The smaller
+partition also produces a different CUDA RNG sequence despite seed 0, confirmed
+from logged times. The two 7g ablations share their initial logged time sequence;
+comparisons to the 3g control are not paired-randomness comparisons. All results
+remain single-seed observations.
+
+| Run | Exponent | Training job | Initialization |
+| --- | ---: | --- | --- |
+| `velocity_riesz_tw1_heun50_h200_b256_seed0_20261028` | 1 | 50041200 | Fresh matched control |
+| `velocity_riesz_tw05_heun50_h200_b256_seed0_20261028` | 0.5 | 50041196 | Fresh ablation |
+| `velocity_riesz_tw0_heun50_h200_b256_seed0_20261028` | 0 | 50041198 | Fresh ablation |
+| `velocity_riesz_tw1_heun50_4x2080_continuation_20261028` | 1 | 50041202 | Original four-GPU run resumed from update 45,000 |
+
+All four use **50 uniform Heun intervals / 100 network evaluations** for
+previews and FID. FID remains **10,000 generated images versus 50,000 training
+images every 5,000 updates**; fixed-noise previews remain every 1,000 updates.
+The original Euler best model and metrics are preserved separately. The Heun
+continuation restores the model, EMA, optimizer, scaler, update count, and
+per-rank RNG state, and starts a new best-FID record for the changed sampler.
+Its next scheduled FID is at update 50,000. The original process was stopped
+during the 45,000-update Euler evaluation after its training checkpoint was
+preserved; that interrupted evaluation is not a completed FID measurement.
+
+The new trainer records pre-clip gradient norms, clipping counts, and AMP
+overflow attempts in five time bins in `time_gradient_diagnostics.json`.
+Removing `(1-t)` increases endpoint gradient magnitudes; finite gradients and
+FID progress must both be checked. The existing monitor now tracks these runs;
+its numerical logging does not constitute visual sample review.
+
+- [Ablation plan and run paths](/project/LongGroup/zonghaoc/mmd_flow_hudson_new/results/cifar/velocity_riesz_time_weight_ablation_20261028.json)
+- [Heun continuation and preserved Euler artifacts](/project/LongGroup/zonghaoc/mmd_flow_hudson_new/results/cifar/velocity_riesz_tw1_heun50_4x2080_continuation_20261028)
+- [Quick sampler comparison at update 44,000](/project/LongGroup/zonghaoc/mmd_flow_hudson_new/results/cifar/velocity_riesz_sampler_audit_20261028_1925/results.json)
+
+The sampler comparison used only 2,048 generated images per method: Euler100
+FID 23.26; uniform Heun50 21.22; EDM Heun50 21.87; uniform Heun100 21.71.
+Those exploratory scores are not directly comparable to FID-10K.
 
 ## Run and model
 

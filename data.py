@@ -1,64 +1,11 @@
-"""Checksum-verified MNIST and CIFAR-10 data loading."""
+"""Checksum-verified CIFAR-10 data loading."""
 from pathlib import Path
-import gzip
 import hashlib
 import pickle
-import struct
 import tarfile
 import urllib.request
-
 import numpy as np
 import torch
-
-FILES = {
-    "train-images-idx3-ubyte.gz": "f68b3c2dcbeaaa9fbdd348bbdeb94873",
-    "train-labels-idx1-ubyte.gz": "d53e105ee54ea40749a09fcbcd1e9432",
-    "t10k-images-idx3-ubyte.gz": "9fb629c4189551a2d022fa330f9573f3",
-    "t10k-labels-idx1-ubyte.gz": "ec29112dd5afa0611ce80d1b7f02629c",
-}
-
-
-BASE_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-
-
-def download_mnist(root: Path) -> Path:
-    """Download all four canonical gzip files, atomically, with MD5 checks."""
-    raw = root / "MNIST" / "raw"
-    raw.mkdir(parents=True, exist_ok=True)
-    for name, checksum in FILES.items():
-        path = raw / name
-        if path.exists() and hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest() == checksum:
-            continue
-        temporary = path.with_suffix(".gz.part")
-        print(f"Downloading {name} to {path}", flush=True)
-        try:
-            urllib.request.urlretrieve(BASE_URL + name, temporary)
-            if hashlib.md5(temporary.read_bytes(), usedforsecurity=False).hexdigest() != checksum:
-                raise RuntimeError(f"MNIST checksum mismatch: {name}")
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
-    return raw
-
-
-
-def load_split(raw: Path, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    prefix = "train" if train else "t10k"
-    with gzip.open(raw / f"{prefix}-images-idx3-ubyte.gz", "rb") as stream:
-        magic, count, rows, columns = struct.unpack(">IIII", stream.read(16))
-        data = stream.read()
-    if magic != 2051 or (rows, columns) != (28, 28) or len(data) != count * 784:
-        raise RuntimeError("Invalid MNIST image file")
-    images = torch.from_numpy(np.frombuffer(data, dtype=np.uint8).copy()).reshape(count, 784)
-    with gzip.open(raw / f"{prefix}-labels-idx1-ubyte.gz", "rb") as stream:
-        magic, label_count = struct.unpack(">II", stream.read(8))
-        data = stream.read()
-    if magic != 2049 or label_count != count or len(data) != count:
-        raise RuntimeError("Invalid MNIST label file")
-    labels = torch.from_numpy(np.frombuffer(data, dtype=np.uint8).copy())
-    return images, labels
-
-
 
 CIFAR10_FILENAME = 'cifar-10-binary.tar.gz'
 
@@ -144,25 +91,3 @@ def load_cifar10_split(archive: Path, train: bool) -> tuple[torch.Tensor, torch.
             images.append(x)
             labels.append(y)
     return torch.cat(images), torch.cat(labels)
-
-
-
-def image_shape(dataset):
-    if dataset == "mnist":
-        return (1, 28, 28)
-    if dataset == "cifar10":
-        return (3, 32, 32)
-    raise ValueError(f"Unknown dataset: {dataset}")
-
-
-def load_dataset(dataset, root):
-    """Return the verified source and both splits using one dataset interface."""
-    if dataset == "mnist":
-        raw = download_mnist(root)
-        loader = load_split
-    elif dataset == "cifar10":
-        raw = download_cifar10(root)
-        loader = load_cifar10_split
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
-    return raw, loader(raw, True), loader(raw, False)

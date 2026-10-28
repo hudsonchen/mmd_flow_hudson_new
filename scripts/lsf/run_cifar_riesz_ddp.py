@@ -1,6 +1,5 @@
-"""Four-GPU direct-velocity CIFAR Riesz, one global interacting particle batch."""
+"""Direct-velocity CIFAR Riesz with one global interacting particle batch."""
 import argparse
-from contextlib import nullcontext
 import copy
 import datetime
 import hashlib
@@ -13,16 +12,15 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-os.environ['DRIFT_COMPILE']='0'
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from cifar_flow_matching import DDPMFlow, FeatureMoments
+from velocity_model import DDPMFlow
 from cifar_riesz_velocity import global_particle_loss, training_time, sample_velocity
 from data import download_cifar10, load_cifar10_split
-from fid import load_inception, frechet_distance
+from fid import FeatureMoments, load_inception, frechet_distance
 from run_storage import new_run_path
 
 
@@ -36,15 +34,6 @@ def save_torch(path, value):
     temporary = path.with_suffix(path.suffix + '.tmp')
     torch.save(value, temporary)
     temporary.replace(path)
-
-
-def rank_indices(count, global_batch, world, rank, update, seed):
-    batches = count // global_batch
-    epoch, batch = divmod(update - 1, batches)
-    permutation = torch.randperm(count, generator=torch.Generator().manual_seed(seed + epoch))
-    local = global_batch // world
-    start = batch * global_batch + rank * local
-    return permutation[start:start + local]
 
 
 def reduce_moments(moments, device):
@@ -67,6 +56,18 @@ def restore_rng(state, device):
     torch.cuda.set_rng_state(state['cuda'], device)
 
 
+def validate_resume_config(saved, current, allow_evaluation_change=False):
+    """Permit only explicitly requested sampler/output changes, never loss changes."""
+    old, new = dict(saved), dict(current)
+    old.setdefault('solver', 'euler')
+    old.setdefault('required_gpu', 'RTX 2080 Ti')
+    permitted = {'output', 'solver', 'sample_steps', 'sampling'} if allow_evaluation_change else set()
+    differences = {key for key in old.keys() | new.keys() if old.get(key) != new.get(key)}
+    if differences - permitted:
+        raise ValueError(f'Resume configuration differs: {sorted(differences - permitted)}')
+    return bool(differences & {'solver', 'sample_steps', 'sampling'})
+
+
 def checkpoint(output, model, ema, optimizer, scaler, update, attempts, best, config, device):
     local = rng_state(device)
     states = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
@@ -85,12 +86,12 @@ def preview(ema, output, update, args, device):
         from torchvision.utils import save_image
         rng = torch.Generator(device=device).manual_seed(8765432)
         noise = torch.randn(32, 3, 32, 32, generator=rng, device=device)
-        raw = torch.cat([sample_velocity(ema, z, args.sample_steps, args.amp)
+        raw = torch.cat([sample_velocity(ema, z, args.sample_steps, args.amp, args.solver)
                          for z in noise.split(args.sample_batch)])
         save_image(((raw+1)/2).clamp(0, 1), output/f'preview_{update:07d}.png', nrow=8)
         write_json(output/f'preview_{update:07d}.json', dict(update=update, count=len(raw),
-            solver='euler', grid='uniform', steps=args.sample_steps,
-            nfe=args.sample_steps, seed=8765432,
+            solver=args.solver, grid='uniform', steps=args.sample_steps,
+            nfe=args.sample_steps*(2 if args.solver=='heun' else 1), seed=8765432,
             raw_pixel_variance=float(raw.var(0).mean()),
             raw_pixel_outside_fraction=float((raw.abs()>1).float().mean())))
     dist.barrier()
@@ -120,7 +121,7 @@ def evaluate(ema, inception, reference, output, update, args, device, intervals=
     preview_images = []
     started = time.monotonic()
     for i, z in enumerate(noise.split(args.sample_batch)):
-        raw = sample_velocity(ema, z.to(device), intervals, args.amp)
+        raw = sample_velocity(ema, z.to(device), intervals, args.amp, args.solver)
         outside += int((raw.abs() > 1).sum())
         pixels = ((raw+1)/2).clamp(0, 1)
         for batch in pixels.split(args.fid_batch):
@@ -128,7 +129,7 @@ def evaluate(ema, inception, reference, output, update, args, device, intervals=
         if rank == 0 and len(preview_images)*args.sample_batch < 100:
             preview_images.append(pixels.cpu())
         if rank == 0 and i % 10 == 0:
-            write_json(output/'evaluation_status.json', dict(update=update, solver='euler',
+            write_json(output/'evaluation_status.json', dict(update=update, solver=args.solver,
                 steps=intervals, rank0_generated=min((i+1)*args.sample_batch, count),
                 rank0_target=count, elapsed_seconds=time.monotonic()-started))
     stats = reduce_moments(moments, device)
@@ -139,11 +140,11 @@ def evaluate(ema, inception, reference, output, update, args, device, intervals=
         from torchvision.utils import save_image
         row = dict(update=update, fid=frechet_distance(*reference[:2], *stats[:2]),
             generated_count=stats[2], reference_count=reference[2], reference_split='train',
-            solver='euler', grid='uniform', steps=intervals, nfe=intervals,
+            solver=args.solver, grid='uniform', steps=intervals, nfe=intervals*(2 if args.solver=='heun' else 1),
             raw_pixel_outside_fraction=int(tally)/(stats[2]*3072),
             evaluation_seconds=time.monotonic()-started,
             preprocessing='unquantized float [0,1], same Inception as Riesz and DDPM')
-        suffix = '' if intervals == args.sample_steps else f'_euler{intervals}'
+        suffix = '' if intervals == args.sample_steps else f'_{args.solver}{intervals}'
         write_json(output/f'metrics_{update:07d}{suffix}.json', row)
         save_image(torch.cat(preview_images)[:100], output/f'samples_{update:07d}{suffix}.png', nrow=10)
         print(json.dumps(row), flush=True)
@@ -166,7 +167,9 @@ def main():
     p.add_argument('--tau', type=float, nargs='+', default=[.2,.05,.02])
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--threads', type=int, default=2)
-    p.add_argument('--sample-steps', type=int, default=100)
+    p.add_argument('--solver', choices=['euler','heun'], default='heun')
+    p.add_argument('--sample-steps', type=int, default=50)
+    p.add_argument('--required-gpu', default='RTX 2080 Ti')
     p.add_argument('--sample-batch', type=int, default=32)
     p.add_argument('--fid-batch', type=int, default=32)
     p.add_argument('--fid-samples', type=int, default=10000)
@@ -174,6 +177,7 @@ def main():
     p.add_argument('--preview-every', type=int, default=1000)
     p.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--resume', type=Path)
+    p.add_argument('--allow-evaluation-change', action='store_true')
     p.add_argument('--smoke', action='store_true')
     args = p.parse_args()
     if min(args.steps,args.batch_per_rank,args.sample_steps,args.threads,args.sample_batch,
@@ -187,8 +191,8 @@ def main():
     if args.eval_every % 1000:p.error('FID cadence must align with recovery checkpoints')
     rank = int(os.environ['RANK']); local_rank = int(os.environ['LOCAL_RANK'])
     world = int(os.environ['WORLD_SIZE'])
-    if world != 4:
-        raise ValueError('This experiment requires exactly four GPUs')
+    if world not in (1, 4):
+        raise ValueError('Supported layouts are one or four GPUs')
     torch.cuda.set_device(local_rank)
     device = torch.device('cuda', local_rank)
     torch.set_num_threads(args.threads)
@@ -213,7 +217,8 @@ def main():
     torch.manual_seed(args.seed + 1009 * rank + 1)
     torch.cuda.manual_seed(args.seed + 1009 * rank + 1)
     global_batch = args.batch_per_rank * world
-    config = {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if k!='resume'}
+    config = {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()
+              if k not in ('resume','allow_evaluation_change')}
     config.update(parameters=parameters, world_size=world, global_batch=global_batch,
         objective='coupled', parameterization='velocity', architecture='ddpm-unet', dataset='cifar10', initialization='random',
         time_sampling=args.time_sampling, shared_time_across_all_ranks=True,
@@ -221,7 +226,7 @@ def main():
         path='x_t=(1-t)*noise+t*image; prediction=x_t+h*v_theta; target=x_(t+h)',
         time_embedding='999*(1-t)', optimizer='Adam beta=(0.9,0.999); 500-update warmup, cosine to 0.1*lr',
         ema='decay .99 through update 1000, then .999',
-        sampling='100 uniform Euler steps by default; one network call per interval',
+        sampling=f'{args.sample_steps} uniform {args.solver} steps; {args.sample_steps*(2 if args.solver=="heun" else 1)} network calls',
         normalization='none', affinity='row-column', reference_coupling='paired', include_self_negative=True,
         feature_space='pixels', prime_steps=0, fork=None,
         training_rule='global paired pixel Riesz; sum power-kernel fields; no velocity MSE',
@@ -234,14 +239,19 @@ def main():
         state = torch.load(args.resume, map_location='cpu', weights_only=False)
         if state.get('lineage_has_flow_matching', True):
             raise ValueError('Riesz resume must not load FM weights')
-        if state['config'] != config:
-            raise ValueError('Resume configuration differs from the saved run')
+        evaluation_changed = validate_resume_config(state['config'], config, args.allow_evaluation_change)
         model.load_state_dict(state['model']); ema.load_state_dict(state['ema'])
         optimizer.load_state_dict(state['optimizer']); scaler.load_state_dict(state['scaler'])
         update, attempts, best = state['update'], state['attempts'], state['best_fid']
         resume_rng = state['rank_rng'][rank]
+        if evaluation_changed:
+            best = float('inf')
+        if rank == 0:
+            write_json(output/'continuation.json', dict(checkpoint=str(args.resume), update=update,
+                prior_config=state['config'], current_config=config, evaluation_changed=evaluation_changed,
+                best_fid_reset=evaluation_changed, optimizer_and_rng_restored=True))
         del state
-        if (output/'best.json').exists():
+        if not evaluation_changed and (output/'best.json').exists():
             best = min(best, json.loads((output/'best.json').read_text())['fid'])
     if rank == 0:
         write_json(output/'config.json', config)
@@ -250,8 +260,8 @@ def main():
         total_memory_bytes=torch.cuda.get_device_properties(device).total_memory,
         capability=torch.cuda.get_device_capability(device), torch=torch.__version__,
         cuda=torch.version.cuda, parameters=parameters)
-    if '2080 Ti' not in hardware['gpu']:
-        raise RuntimeError(f"Expected RTX 2080 Ti, got {hardware['gpu']}")
+    if args.required_gpu not in hardware['gpu']:
+        raise RuntimeError(f"Expected {args.required_gpu}, got {hardware['gpu']}")
     write_json(output/f'hardware_rank{rank}.json', hardware)
     # Host-resident uint8 data avoids four full floating-point GPU copies.
     archive = download_cifar10(args.data_root)
@@ -278,6 +288,8 @@ def main():
     torch.cuda.reset_peak_memory_stats(device)
     overflows = 0
     consecutive_overflows = 0
+    time_bins = [dict(count=0, grad_sum=0., grad_max=0., clipped=0, overflow_attempts=0)
+                 for _ in range(5)]
     target_updates = 3 if args.smoke else args.steps
     while update < target_updates:
         attempts += 1
@@ -292,6 +304,7 @@ def main():
             shared_time.fill_([.001, .77, .999][update])
         dist.broadcast(shared_time, src=0)
         t = float(shared_time)
+        time_bin = time_bins[min(int(t*5),4)]
         h = min(args.horizon, 1-t)
         source = (1-t)*noise + t*clean
         target = (1-t-h)*noise + (t+h)*clean
@@ -318,6 +331,7 @@ def main():
         scaler.step(optimizer); scaler.update()
         if scaler.get_scale() < old_scale:
             overflows += 1
+            time_bin['overflow_attempts'] += 1
             consecutive_overflows += 1
             if consecutive_overflows > 20:
                 raise RuntimeError('Repeated FP16 overflow')
@@ -326,6 +340,11 @@ def main():
         if not torch.isfinite(grad):
             raise RuntimeError('Nonfinite unscaled gradient')
         update += 1
+        grad_value = float(grad)
+        time_bin['count'] += 1
+        time_bin['grad_sum'] += grad_value
+        time_bin['grad_max'] = max(time_bin['grad_max'], grad_value)
+        time_bin['clipped'] += int(grad_value > 1.)
         with torch.no_grad():
             for averaged, current in zip(ema.parameters(), model.parameters()):
                 averaged.lerp_(current, .001 if update>1000 else .01)
@@ -342,6 +361,10 @@ def main():
         if args.smoke:
             continue
         if update%1000 == 0 or update==args.steps:
+            if rank == 0:
+                write_json(output/'time_gradient_diagnostics.json', dict(update=update,
+                    since_resume=True, edges=[0.,.2,.4,.6,.8,1.], bins=time_bins,
+                    definition='Pre-clip gradient norms after DDP reduction; overflow attempts separate'))
             checkpoint(output,model,ema,optimizer,scaler,update,attempts,best,config,device)
         if update%args.preview_every == 0:
             preview(ema,output,update,args,device)
