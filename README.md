@@ -32,6 +32,12 @@ file checksums. The already-running CIFAR job uses a temporary link at its old
 path; a cleanup watcher removes that link once the process exits. Its physical
 outputs are stored under `results/cifar/`.
 
+## CIFAR-10 training progress
+
+See [the CIFAR-10 report](CIFAR10_SYMMETRIC_RIESZ_DIT.md) for the two Riesz
+U-Net runs: dated update counts, FID learning curves, loss/gradient diagnostics,
+and generated-image previews. The report also preserves the original DiT launch record.
+
 ## Run experiments
 
 The 2026-10-27 symmetric paired-reference follow-up tests a finite-population
