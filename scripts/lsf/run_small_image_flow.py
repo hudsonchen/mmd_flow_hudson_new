@@ -160,11 +160,16 @@ def main():
     p.add_argument('--reference-time-power',type=float,default=0.,help='Multiply local Riesz loss by (1-t)^power; power1 cancels the denoiser Jacobian singularity')
     p.add_argument('--local-pixel-scales',type=int,nargs='+',help='Average local Riesz losses on fixed pooled pixel resolutions; no learned encoder')
     p.add_argument('--include-self-negative',action='store_true',help='Include zero-displacement self negatives in local paired Riesz affinity normalization')
+    p.add_argument('--distance-powers',type=float,nargs='+',default=[1.],help='Sum Riesz kernel forces for powers p in (r/scale)^p; local row-column loss only')
     p.add_argument('--distance-smoothing',type=float,default=0.,help='Local paired Riesz smooth-norm radius relative to mean batch distance')
     p.add_argument('--anchor-weight',type=float,default=1.)
     p.add_argument('--riesz-weight',type=float,default=.1)
     p.add_argument('--marginal-weight',type=float,default=.1)
     args=p.parse_args()
+    if any(not math.isfinite(p) or not 0<p<=2 for p in args.distance_powers) or len(set(args.distance_powers))!=len(args.distance_powers):
+        p.error('--distance-powers requires distinct finite powers in (0, 2]')
+    if args.distance_powers!=[1.] and (args.objective!='coupled' or args.affinity!='row-column'):
+        p.error('Multiple/nonunit distance powers require --objective coupled --affinity row-column')
     if args.preview_every<0:p.error('--preview-every must be nonnegative')
     if args.preview_every and args.decode_primed:p.error('Training previews currently require direct image sampling')
     args.image_channels,args.image_size,_=image_geometry(args.dataset)
@@ -404,7 +409,7 @@ def main():
                 time_weight_power=args.reference_time_power,pixel_scales=args.local_pixel_scales,image_shape=image_geometry(args.dataset),
                 repulsion_weight=args.repulsion_weight,affinity=args.affinity,
                 coordinate_scale=reference_scale(min(1.,t+args.horizon)),
-                include_self_negative=args.include_self_negative,distance_smoothing=args.distance_smoothing,
+                include_self_negative=args.include_self_negative,distance_smoothing=args.distance_smoothing,distance_powers=args.distance_powers,
                 exclude_target_diagonal=args.reference_coupling=='paired-loo')
         else:
             target=draw_training(args.target_batch or args.batch*2)

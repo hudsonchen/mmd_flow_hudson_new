@@ -1,6 +1,7 @@
 """GPU memory/runtime preflight; no optimizer updates or trained image models."""
 import argparse
 import copy
+import math
 import os
 from pathlib import Path
 import sys
@@ -40,6 +41,7 @@ def main():
     p.add_argument('--reference-time-power',type=float,default=0.)
     p.add_argument('--local-pixel-scales',type=int,nargs='+')
     p.add_argument('--include-self-negative',action='store_true')
+    p.add_argument('--distance-powers',type=float,nargs='+',default=[1.],help='Sum Riesz kernel forces for powers p in (r/scale)^p; local row-column loss only')
     p.add_argument('--distance-smoothing',type=float,default=0.)
     p.add_argument('--normalization',choices=['none','temperature','global'],default='temperature')
     p.add_argument('--horizon',type=float,default=.1)
@@ -54,6 +56,10 @@ def main():
     p.add_argument('--local-diagnostics',type=int,default=0,help='Independent batches for local gradient comparison with analytic reference-velocity MSE; no optimizer updates')
     p.add_argument('--local-hybrid',action='store_true',help='Include one-call reference-denoising/Riesz hybrid in local benchmark')
     args=p.parse_args()
+    if any(not math.isfinite(p) or not 0<p<=2 for p in args.distance_powers) or len(set(args.distance_powers))!=len(args.distance_powers):
+        p.error("--distance-powers requires distinct finite powers in (0, 2]")
+    if args.distance_powers!=[1.] and (not args.local_only or args.affinity!="row-column" or args.local_hybrid or args.local_diagnostics):
+        p.error("Multiple/nonunit powers require local-only row-column preflight without hybrid/gradient diagnostics")
     if args.local_diagnostics<0 or (args.local_diagnostics and not args.local_only):p.error('Local diagnostics require --local-only and nonnegative repeats')
     if args.local_pixel_scales and not args.local_only:p.error('Pixel-scale preflight requires --local-only')
     if args.local_hybrid and (not args.local_only or args.parameterization!='denoiser'):p.error('Hybrid benchmark requires a local-only denoiser')
@@ -108,7 +114,7 @@ def main():
                 local_target=clean if paired else target
                 local_noise=noise if paired else torch.randn_like(local_target)
                 loss=marginal_loss(model,clean,noise,local_target,local_noise,.5,args.horizon,
-                    include_self_negative=args.include_self_negative,distance_smoothing=args.distance_smoothing,
+                    include_self_negative=args.include_self_negative,distance_smoothing=args.distance_smoothing,distance_powers=args.distance_powers,
                     pixel_scales=args.local_pixel_scales,image_shape=shape,
                     taus=[.2,.05,.02],normalization=args.normalization,affinity=args.affinity,
                     time_weight_power=args.reference_time_power,exclude_target_diagonal=objective=='local-paired-loo')

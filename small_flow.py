@@ -209,13 +209,21 @@ class DenoiserVelocity(torch.nn.Module):
 
 
 def row_column_riesz_loss(prediction,target,taus,normalization,negative,repulsion_weight,exclude_target_diagonal=False,
-                          query_tail_scale=0.,query_tail_max_weight=4.,include_self_negative=False,distance_smoothing=0.):
-    """Drifting row/column affinities with Riesz unit-direction forces.
+                          query_tail_scale=0.,query_tail_max_weight=4.,include_self_negative=False,distance_smoothing=0.,distance_powers=(1.,)):
+    """Sum power-distance Riesz forces using Drifting row/column affinities.
 
     Positive and negative affinities share softmax normalization. Cross-mass
-    balancing follows Drifting, but forces use unit directions divided by tau,
-    rather than Drifting's raw displacements. Targets and fields are detached.
+    balancing follows Drifting. Each power p uses potential (r/scale)**p and
+    force p*(r/scale)**(p-1)*unit_direction/tau. Sum fields across powers
+    and temperatures without averaging. p=1 preserves the original recipe.
+    Optional smoothing replaces r**p with (r*r+eps*eps)**(p/2)-eps**p.
+    The 1e-6 force-distance floor bounds the p<1 singularity; exact zero
+    displacements contribute zero. Targets, scales, affinities and fields
+    are detached. normalization='none' disables field RMS normalization,
+    not coordinate scaling or softmax affinity normalization.
     """
+    if not distance_powers or any(not math.isfinite(p) or not 0<p<=2 for p in distance_powers) or len(set(distance_powers))!=len(distance_powers):
+        raise ValueError('Distance powers must be distinct finite numbers in (0, 2]')
     if len(prediction)<2 or len(target)<1: raise ValueError('Need at least two queries and one target')
     if not taus or any(t<=0 for t in taus): raise ValueError('Temperatures must be positive')
     if normalization not in ['none','temperature','global']: raise ValueError('Unknown field normalization')
@@ -253,36 +261,44 @@ def row_column_riesz_loss(prediction,target,taus,normalization,negative,repulsio
             nearest=normalized_distance[:,split:].masked_fill(mask[:,split:],float('inf')).min(-1).values
             query_weights=(1+(nearest/query_tail_scale).square()).clamp_max(query_tail_max_weight)[:,None]
         field=torch.zeros_like(query)
-        for tau in taus:
-            logits=(-normalized_distance/tau).masked_fill(mask,float('-inf'))
-            affinity=(logits.softmax(-1)*logits.softmax(-2)).sqrt()
-            neg,pos=affinity[:,:split],affinity[:,split:]
-            pos_coeff=pos*neg.sum(-1,keepdim=True)
-            neg_coeff=neg*pos.sum(-1,keepdim=True)
-            chunks=[]
-            for start in range(0,len(query),32):
-                q=query[start:start+32]
-                dp=positive[None]-q[:,None]
-                dn=negatives[None]-q[:,None]
-                positive_norm=(dp.square().sum(-1)+smoothing.square()).sqrt() if distance_smoothing else dp.norm(dim=-1)
-                negative_norm=(dn.square().sum(-1)+smoothing.square()).sqrt() if distance_smoothing else dn.norm(dim=-1)
-                attraction=(dp*(pos_coeff[start:start+32]/positive_norm.clamp_min(1e-6))[...,None]).sum(1)
-                repulsion=(dn*(neg_coeff[start:start+32]/negative_norm.clamp_min(1e-6))[...,None]).sum(1)
-                chunks.append((attraction-repulsion_weight*repulsion)/tau)
-            force=torch.cat(chunks)
-            if query_tail_scale:force=force*query_weights
-            if normalization=='temperature': force=force/force.square().mean().clamp_min(1e-8).sqrt()
-            field+=force
+        for power in distance_powers:
+            powered_distance=normalized_distance if power==1. else ((distances.square()+smoothing.square()).pow(power/2)-smoothing.pow(power))/scale.pow(power)
+            for tau in taus:
+                logits=(-powered_distance/tau).masked_fill(mask,float('-inf'))
+                affinity=(logits.softmax(-1)*logits.softmax(-2)).sqrt()
+                neg,pos=affinity[:,:split],affinity[:,split:]
+                pos_coeff=pos*neg.sum(-1,keepdim=True)
+                neg_coeff=neg*pos.sum(-1,keepdim=True)
+                chunks=[]
+                for start in range(0,len(query),32):
+                    q=query[start:start+32]
+                    dp=positive[None]-q[:,None]
+                    dn=negatives[None]-q[:,None]
+                    positive_norm=(dp.square().sum(-1)+smoothing.square()).sqrt() if distance_smoothing else dp.norm(dim=-1)
+                    negative_norm=(dn.square().sum(-1)+smoothing.square()).sqrt() if distance_smoothing else dn.norm(dim=-1)
+                    positive_weight=pos_coeff[start:start+32]/positive_norm.clamp_min(1e-6)
+                    negative_weight=neg_coeff[start:start+32]/negative_norm.clamp_min(1e-6)
+                    if power!=1.:
+                        positive_weight=positive_weight*power*(positive_norm.clamp_min(1e-6)/scale).pow(power-1)
+                        negative_weight=negative_weight*power*(negative_norm.clamp_min(1e-6)/scale).pow(power-1)
+                    attraction=(dp*positive_weight[...,None]).sum(1)
+                    repulsion=(dn*negative_weight[...,None]).sum(1)
+                    chunks.append((attraction-repulsion_weight*repulsion)/tau)
+                force=torch.cat(chunks)
+                if query_tail_scale:force=force*query_weights
+                if normalization=='temperature': force=force/force.square().mean().clamp_min(1e-8).sqrt()
+                field+=force
         if normalization=='global': field=field/field.square().mean().sqrt().clamp_min(1e-8)
         goal=query/scale_inputs+field
     return (prediction/scale_inputs-goal).square().mean(),dict(frozen_velocity=field,scale_inputs=scale_inputs,query_tail_weights=query_weights)
 
 
 def riesz_loss(prediction, target, taus=(.1,), normalization='none', negative=None, repulsion_weight=1.,affinity='row',exclude_target_diagonal=False,
-               query_tail_scale=0.,query_tail_max_weight=4.,include_self_negative=False,distance_smoothing=0.):
+               query_tail_scale=0.,query_tail_max_weight=4.,include_self_negative=False,distance_smoothing=0.,distance_powers=(1.,)):
     if affinity=='row-column':
         return row_column_riesz_loss(prediction,target,taus,normalization,negative,repulsion_weight,exclude_target_diagonal,
-            query_tail_scale,query_tail_max_weight,include_self_negative,distance_smoothing)
+            query_tail_scale,query_tail_max_weight,include_self_negative,distance_smoothing,distance_powers)
+    if tuple(distance_powers)!=(1.,):raise ValueError('Distance powers require row-column affinity')
     if affinity!='row': raise ValueError('Unknown Riesz affinity')
     if include_self_negative or distance_smoothing:raise ValueError('Self normalization and smoothing require row-column affinity')
     if exclude_target_diagonal: raise ValueError('Matched-target exclusion requires row-column affinity')

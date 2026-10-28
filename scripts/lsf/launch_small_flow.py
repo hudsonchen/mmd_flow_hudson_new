@@ -43,7 +43,7 @@ def main():
     source = study/'source'
     files = ['small_flow.py','backbone.py','loss.py','sinkhorn.py','run_storage.py','reference_dit.py','flow_path.py',
              'scripts/lsf/run_small_flow.py','scripts/lsf/launch_small_flow.py','tests/test_small_flow.py','AGENTS.md']
-    files+=['tests/test_reference_dit.py']
+    files+=['tests/test_reference_dit.py','tests/test_riesz_power.py']
     files += [str(p.relative_to(ROOT)) for p in ROOT.glob('*LICENSE*')]
     if (ROOT/'assets/SCORE_SDE_LICENSE').exists(): files.append('assets/SCORE_SDE_LICENSE')
     if args.audit:

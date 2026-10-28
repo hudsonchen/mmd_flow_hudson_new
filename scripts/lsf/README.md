@@ -1,5 +1,39 @@
 # CIFAR-10 priming on LSF
 
+## Direct-velocity mixed-kernel Riesz on four RTX 2080 Ti GPUs
+
+`launch_cifar_riesz_ddp.py --name NAME --submit` freezes and tests a fresh
+61,804,419-parameter DDPM U-Net run, then submits a four-GPU preflight and
+dependent training on `longgpu01`. The network directly predicts unrestricted
+velocity, without the denoiser division by `1-t`. Initialization is random;
+there is no FM, diffusion, reconstruction, or encoder weight transfer.
+
+The existing paired pixel Riesz force sums powers 0.8, 1.0, and 1.5 over
+temperatures 0.2, 0.05, and 0.02, without force RMS normalization. Each rank
+handles 64 images. Predictions and targets are gathered into the same global
+256-particle population on every rank before calculating affinities and forces.
+Only local queries retain gradients; multiplying the loss by four compensates
+for DDP's gradient averaging. Independent local 64-particle losses would change
+the objective and are not used. CPU tests compare partitioned gradients with
+the original full-batch coupled loss, including endpoint intervals.
+
+One time is drawn for the entire global batch from Meta's skewed distribution
+`sigmoid(1.2 - 1.2 * N(0,1))`, clipped to `[0.0001, 0.999]`. Training uses the
+affine reference path and interval `min(0.01, 1-t)`. The existing `(1-t)` loss
+weight is retained as an explicit weighting choice, although direct velocity
+no longer needs it to cancel a denoiser Jacobian. The existing Riesz Adam
+schedule (500-update warmup to 2e-4, cosine floor 2e-5), clipping at 1, and
+EMA schedule are retained; FP16 autocast and gradient scaling fit the GPUs.
+
+The budget is 100,000 optimizer updates. Sampling remains 100 uniform Euler
+steps, previews and full recovery checkpoints occur every 1,000 updates, and
+distributed FID-10K against all 50,000 training images occurs every 5,000.
+Latest/best checkpoints include optimizer, GradScaler, and all four RNG states;
+resume requires matching configuration and Riesz-only provenance. The GPU
+preflight tests times 0.001, 0.77, and 0.999, actual sampling/Inception, identical
+parameters across ranks, memory use, and checkpoint serialization. The preflight
+checkpoint is not used to initialize training. All artifacts use project storage.
+
 ## Distributed flow matching with the diffusion U-Net
 
 `launch_cifar_fm_ddp.py --name NAME --submit` creates a frozen experiment in
@@ -479,3 +513,36 @@ positive. It uses no rollout loss, trained FM teacher, or VGG post-training
 encoder. Reconstruction-only LPIPS priming remains supported. The local smoke
 test accepts `--local-hybrid` to verify finite backward gradients and measure its
 incremental cost against plain local Riesz on the same GPU allocation.
+
+
+### CIFAR combined-power Riesz follow-up (2026-10-28)
+
+The unchanged 61,804,419-parameter `ddpm-unet` can use
+`--distance-powers 0.8 1.0 1.5 --normalization none` with the paired
+`--objective coupled --affinity row-column` recipe. These options sum all
+three power-kernel fields in **one loss**, across every configured temperature;
+they do not launch separate runs and do not average or RMS-normalize the fields.
+
+For distance `r` and the existing detached mean-distance scale `s`, power `p`
+uses affinity logits `-(r/s)^p / tau` and radial force
+`p * (r/s)^(p-1) * (target-query)/r / tau`, with the existing row/column
+cross-mass coefficients. The three powers have equal coefficient 1. This is
+a sum of separately constructed kernel forces, not a single softmax of the
+sum of powers. Softmax affinity normalization and coordinate scaling remain;
+force RMS normalization is disabled. Gradient clipping at norm 1 remains.
+The existing `1e-6` force-distance floor regularizes the fractional-power
+singularity, and exact coincident points contribute zero displacement.
+No additional distance smoothing is enabled in this trial.
+
+`--distance-powers 1` preserves the original loss, including existing
+normalization choices. Multiple/nonunit powers currently require the coupled
+row-column image objective. The GPU preflight accepts the same powers with
+`--local-only`; its output records the actual configuration. The launcher
+freezes the power-kernel tests alongside the source.
+
+The combined-power trial starts from random weights, seed 0, using batch 256,
+100,000 updates, peak LR 2e-4, reference interval 0.01, 100 Euler sampling
+steps, previews every 1,000 updates, and FID-10K every 5,000 updates against
+the full 50,000-image training split. No diffusion/FM weights or learned
+feature encoder are used. Architecture and optimizer schedule match the
+original 100-step Riesz U-Net run.
