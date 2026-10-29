@@ -140,5 +140,9 @@ class ImageNetJiTTests(unittest.TestCase):
             self.assertEqual(tuple(images[0].shape),(3,64,64))
             self.assertEqual(images[0].dtype,torch.uint8)
             self.assertEqual(len(identity['spot_sha256']),4)
+            (base/'LOC_train_solution.csv').write_text('\n'.join(rows[:2])+'\n')
+            complete=build_index(root,output,expected_count=4,expected_classes=2)
+            self.assertEqual(complete['count'],4)
+            self.assertEqual(complete['index_sha256'],identity['index_sha256'])
 
 if __name__=='__main__':unittest.main()
