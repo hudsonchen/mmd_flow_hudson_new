@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Subset
 from cifar_riesz_velocity import global_particle_loss
 
 from fid import FeatureMoments, load_inception, frechet_distance
+from imagenet64_fid_reference import load_benchmark_reference
 from run_storage import new_run_path
 
 
@@ -63,11 +64,15 @@ def validate_resume_config(saved, current, allow_evaluation_change=False):
     old, new = dict(saved), dict(current)
     old.setdefault('solver', 'euler')
     old.setdefault('required_gpu', 'RTX 2080 Ti')
-    permitted = {'output', 'solver', 'sample_steps', 'sampling'} if allow_evaluation_change else set()
+    for key in ('fid_reference', 'fid_reference_sha256'):
+        old.setdefault(key, None)
+        new.setdefault(key, None)
+    evaluation_keys = {'solver', 'sample_steps', 'sampling', 'fid_reference', 'fid_reference_sha256', 'fid'}
+    permitted = {'output'} | evaluation_keys if allow_evaluation_change else set()
     differences = {key for key in old.keys() | new.keys() if old.get(key) != new.get(key)}
     if differences - permitted:
         raise ValueError(f'Resume configuration differs: {sorted(differences - permitted)}')
-    return bool(differences & {'solver', 'sample_steps', 'sampling'})
+    return bool(differences & evaluation_keys)
 
 
 def checkpoint(output, model, ema, optimizer, scaler, update, attempts, best, config, device):
@@ -150,7 +155,10 @@ def evaluate(ema, inception, reference, output, update, args, device, intervals=
     if rank == 0:
         from torchvision.utils import save_image
         row = dict(update=update, fid=frechet_distance(*reference[:2], *stats[:2]),
-            generated_count=stats[2], reference_count=reference[2], reference_split='train',
+            generated_count=stats[2], reference_count=reference[2],
+            reference_split='benchmark' if args.fid_reference else 'train',
+            reference_path=str(args.fid_reference) if args.fid_reference else str(output/'fid_reference.npz'),
+            reference_sha256=args.fid_reference_sha256,
             cfg=args.cfg,cfg_interval=[args.cfg_min_time,args.cfg_max_time],class_labels='balanced modulo 1000',
             solver=args.solver, grid='uniform', steps=intervals, nfe=intervals*(2 if args.solver=='heun' else 1),
             raw_pixel_outside_fraction=int(tally)/(stats[2]*12288),
@@ -193,6 +201,8 @@ def main():
     p.add_argument('--sample-batch', type=int, default=32)
     p.add_argument('--fid-batch', type=int, default=32)
     p.add_argument('--fid-samples', type=int, default=10000)
+    p.add_argument('--fid-reference', type=Path)
+    p.add_argument('--fid-reference-sha256')
     p.add_argument('--eval-every', type=int, default=5000)
     p.add_argument('--preview-every', type=int, default=1000)
     p.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
@@ -200,6 +210,13 @@ def main():
     p.add_argument('--allow-evaluation-change', action='store_true')
     p.add_argument('--smoke', action='store_true')
     args = p.parse_args()
+    if bool(args.fid_reference) != bool(args.fid_reference_sha256):
+        p.error('--fid-reference and --fid-reference-sha256 must be supplied together')
+    benchmark_reference = None
+    benchmark_metadata = None
+    if args.fid_reference:
+        benchmark_reference, benchmark_metadata = load_benchmark_reference(
+            args.fid_reference, args.fid_reference_sha256)
     args.steps = math.ceil(args.epochs*1281167/args.global_batch)
     args.warmup_steps = args.warmup_epochs*1281167/args.global_batch
     if min(args.steps,args.global_batch,args.sample_steps,args.threads,args.sample_batch,
@@ -264,6 +281,8 @@ def main():
         interaction_batch=global_batch, ddp_backward_scale=world,
         fid='FID-10K versus all 1281167 ImageNet train images center-cropped to 64; unquantized pixels',
         lineage_has_flow_matching=False)
+    if args.fid_reference:
+        config['fid'] = 'FID-10K versus saved ImageNet64 benchmark statistics; unquantized generated pixels'
     update, attempts, best = 0, 0, float('inf')
     resume_rng = None
     if args.resume:
@@ -286,6 +305,8 @@ def main():
             best = min(best, json.loads((output/'best.json').read_text())['fid'])
     if rank == 0:
         write_json(output/'config.json', config)
+        if benchmark_metadata is not None:
+            write_json(output/'fid_reference.json', benchmark_metadata)
         write_json(output/'status.json', dict(status='initializing', update=update))
     hardware = dict(rank=rank, gpu=torch.cuda.get_device_name(device),
         allocated_gpu=os.environ.get('MMD_ALLOCATED_GPU'),
@@ -309,7 +330,7 @@ def main():
     if Path(identity['root']) != args.data_root.resolve():
         raise RuntimeError('ImageNet data root changed')
     inception = None
-    reference = None
+    reference = benchmark_reference
     # FID initialization is deferred to the first evaluation, so training starts promptly.
     def ensure_fid():
         nonlocal inception, reference

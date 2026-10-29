@@ -50,6 +50,21 @@ the canonical downsampled-ImageNet64 reference protocol. Reference statistics
 are cached at the first scheduled FID. Previews and recovery checkpoints are
 saved every 1000 updates; an initial recovery checkpoint is saved at update 3.
 
+The approved benchmark-reference continuation instead uses the saved
+`VIRTUAL_imagenet64_labeled.npz` mean/covariance, extracted without numerical
+changes into `VIRTUAL_imagenet64_fid_only.npz`. Set `FID_REFERENCE` and
+`FID_REFERENCE_SHA256` in the cluster launcher, plus `RESUME_FROM` for an
+existing checkpoint. The evaluator validates the hash, dimensions, finite
+values, and covariance symmetry before training and never reads reference
+images in this mode. `fid_reference.json` records the reference provenance;
+metric rows identify the benchmark and its hash. The archive does not encode
+its reference sample count, so that field is null rather than inferred from
+the 10,000 images bundled in the original archive. Generated samples retain
+the existing unquantized float preprocessing and pytorch-fid Inception.
+Changing reference requires explicit evaluation-change permission during
+resume and resets best-FID selection, while restoring model, EMA, optimizer,
+scaler, update, attempt counter, and each rank's RNG state.
+
 Deployment uses the dedicated GitHub branch, an isolated cluster checkout,
 and explicit SAN outputs. The three-update preflight uses the full 1024 batch,
 endpoint times, parameter synchronization, short CFG sampling, Inception,

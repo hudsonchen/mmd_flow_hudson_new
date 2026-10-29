@@ -20,8 +20,12 @@ def write_json(path, value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--study',type=Path,required=True)
+    parser.add_argument('--fid-reference',type=Path,default=os.environ.get('FID_REFERENCE'))
+    parser.add_argument('--fid-reference-sha256',default=os.environ.get('FID_REFERENCE_SHA256'))
+    parser.add_argument('--resume-from',type=Path,default=os.environ.get('RESUME_FROM'))
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo))
     study = args.study.resolve()
     if not str(study).startswith('/SAN/intelsys/imagenet_mmd_flow/'):
         raise ValueError('This cs-cluster launch requires explicit SAN output storage')
@@ -43,6 +47,13 @@ def main():
         '--solver','heun','--sample-steps','50','--required-gpu','H100']
     commands = dict(preflight=common+['--output',str(study/'preflight'),'--smoke','--sample-steps','2'],
                     training=common+['--output',str(study/'training')])
+    if args.fid_reference:
+        from imagenet64_fid_reference import load_benchmark_reference
+        load_benchmark_reference(args.fid_reference, args.fid_reference_sha256)
+        commands['training'] += ['--fid-reference',str(args.fid_reference),
+            '--fid-reference-sha256',args.fid_reference_sha256]
+    if args.resume_from:
+        commands['training'] += ['--resume',str(args.resume_from),'--allow-evaluation-change']
     manifest = dict(source=str(repo),source_commit=subprocess.check_output(
         ['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),source_sha256=hashes,
         job_id=os.environ.get('JOB_ID'),host=os.uname().nodename,allocated_device_ids=devices,
@@ -74,7 +85,7 @@ def main():
                 for name in ['dataset_index.json','dataset_identity.json']:
                     if not (output/name).exists():
                         os.link(study/'preflight'/name,output/name)
-                if (output/'latest.pt').exists():
+                if (output/'latest.pt').exists() and not args.resume_from:
                     command=command+['--resume',str(output/'latest.pt')]
             status('running')
             print(json.dumps(dict(stage=stage,command=command)),flush=True)
