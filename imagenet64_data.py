@@ -1,6 +1,7 @@
 """ImageNet training images, JiT/ADM center crop to 64px, no learned encoder."""
 import hashlib
 import json
+import csv
 from pathlib import Path
 from PIL import Image
 import torch
@@ -10,18 +11,36 @@ from torchvision.transforms.functional import pil_to_tensor
 from vendor.jit.crop import center_crop_arr
 
 
-def build_index(root, output):
+def build_index(root, output, expected_count=1281167, expected_classes=1000):
     root = Path(root).resolve()
-    images = ImageFolder(root)
-    if len(images.classes) != 1000 or len(images) != 1281167:
-        raise ValueError(f'Expected full ImageNet train: got {len(images.classes)} classes, {len(images)} images')
-    records = [(str(Path(path).relative_to(root)), label) for path,label in images.samples]
+    manifest = root.parents[3]/'LOC_train_solution.csv'
+    source = {}
+    if manifest.exists():
+        print(f'Indexing ImageNet from {manifest}',flush=True)
+        with manifest.open(newline='') as stream:
+            ids = [row['ImageId'] for row in csv.DictReader(stream)]
+        if len(ids)!=len(set(ids)):
+            raise ValueError('Duplicate image IDs in ImageNet manifest')
+        classes = sorted({image_id.split('_',1)[0] for image_id in ids})
+        class_to_idx = {name:i for i,name in enumerate(classes)}
+        records = sorted((f'{image_id.split("_",1)[0]}/{image_id}.JPEG',
+                          class_to_idx[image_id.split('_',1)[0]]) for image_id in ids)
+        source = dict(index_source=str(manifest),
+                      manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+    else:
+        print('Indexing ImageNet by directory traversal',flush=True)
+        images = ImageFolder(root)
+        classes = images.classes
+        records = [(str(Path(path).relative_to(root)),label) for path,label in images.samples]
+    if len(classes)!=expected_classes or len(records)!=expected_count:
+        raise ValueError(f'Expected full ImageNet train: got {len(classes)} classes, {len(records)} images')
+    print(f'Checking source files for {len(records)} indexed images',flush=True)
     encoded = json.dumps(records, separators=(',',':')).encode()
     destination = Path(output)/'dataset_index.json'
     temporary = destination.with_suffix('.tmp')
     temporary.write_bytes(encoded)
     temporary.replace(destination)
-    identity = dict(root=str(root), count=len(records), classes=images.classes,
+    identity = dict(root=str(root), count=len(records), classes=classes, **source,
         index_sha256=hashlib.sha256(encoded).hexdigest(),
         preprocessing='Official JiT/ADM center crop to 64, RGB uint8; training random horizontal flip; normalize to [-1,1]',
         split='train', conditioning='class-matched global interaction batches; 10% unconditional mixed-class batches',

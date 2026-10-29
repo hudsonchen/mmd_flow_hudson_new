@@ -1,11 +1,15 @@
 """Three-rank loss equivalence and official JiT/ImageNet adapters."""
 import copy
+import tempfile
+import json
+from pathlib import Path
+from PIL import Image
 import unittest
 import torch
 from cifar_riesz_velocity import global_particle_loss
 from riesz_loss import riesz_loss
 from imagenet64_jit import JiTVelocity, sample_time, learning_rate, sample_velocity
-from imagenet64_data import RandomImageBatches
+from imagenet64_data import RandomImageBatches, build_index, ImageNet64
 
 class ImageNetJiTTests(unittest.TestCase):
     def setUp(self):
@@ -116,5 +120,25 @@ class ImageNetJiTTests(unittest.TestCase):
                 self.assertTrue((first['images']==first['label']).all())
                 self.assertTrue((second['images']==second['label']).all())
         self.assertTrue(60<dropped<140)
+
+    def test_manifest_index_matches_real_rgb_image_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory)
+            root=base/'ILSVRC/Data/CLS-LOC/train'
+            output=base/'output';output.mkdir()
+            rows=['ImageId,PredictionString']
+            for name in ['n00000001','n00000002']:
+                (root/name).mkdir(parents=True)
+                for i in range(2):
+                    image_id=f'{name}_{i}'
+                    Image.new('RGB',(80,100)).save(root/name/f'{image_id}.JPEG')
+                    rows.append(f'{image_id},{name} 0 0 1 1')
+            (base/'LOC_train_solution.csv').write_text('\n'.join(rows)+'\n')
+            identity=build_index(root,output,expected_count=4,expected_classes=2)
+            self.assertEqual(identity['count'],4)
+            images=ImageNet64(root,output/'dataset_index.json')
+            self.assertEqual(tuple(images[0].shape),(3,64,64))
+            self.assertEqual(images[0].dtype,torch.uint8)
+            self.assertEqual(len(identity['spot_sha256']),4)
 
 if __name__=='__main__':unittest.main()
