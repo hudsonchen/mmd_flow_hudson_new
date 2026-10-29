@@ -144,5 +144,12 @@ class ImageNetJiTTests(unittest.TestCase):
             complete=build_index(root,output,expected_count=4,expected_classes=2)
             self.assertEqual(complete['count'],4)
             self.assertEqual(complete['index_sha256'],identity['index_sha256'])
+            cls_list=base/'ILSVRC/ImageSets/CLS-LOC/train_cls.txt'
+            cls_list.parent.mkdir(parents=True)
+            records=json.loads((output/'dataset_index.json').read_text())
+            cls_list.write_text(''.join(f'{path[:-5]} {i+1}\n' for i,(path,_) in enumerate(records)))
+            canonical=build_index(root,output,expected_count=4,expected_classes=2)
+            self.assertEqual(canonical['index_sha256'],identity['index_sha256'])
+            self.assertEqual(canonical['index_source'],str(cls_list))
 
 if __name__=='__main__':unittest.main()

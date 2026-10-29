@@ -15,35 +15,47 @@ from vendor.jit.crop import center_crop_arr
 
 def build_index(root, output, expected_count=1281167, expected_classes=1000):
     root = Path(root).resolve()
-    manifest = root.parents[3]/'LOC_train_solution.csv'
-    source = {}
-    ids = []
-    if manifest.exists():
-        print(f'Indexing ImageNet from {manifest}',flush=True)
-        with manifest.open(newline='') as stream:
-            ids = [row['ImageId'] for row in csv.DictReader(stream)]
-        if len(ids)!=len(set(ids)):
-            raise ValueError('Duplicate image IDs in ImageNet manifest')
-    if len(ids)==expected_count:
-        classes = sorted({image_id.split('_',1)[0] for image_id in ids})
+    classification = root.parents[2]/'ImageSets/CLS-LOC/train_cls.txt'
+    if classification.exists():
+        print(f'Indexing full ImageNet classification list {classification}',flush=True)
+        paths = [line.split()[0]+'.JPEG' for line in classification.read_text().splitlines() if line.strip()]
+        if len(paths)!=len(set(paths)) or any(Path(path).is_absolute() or '..' in Path(path).parts for path in paths):
+            raise ValueError('Invalid or duplicate classification paths')
+        classes = sorted({path.split('/')[0] for path in paths})
         class_to_idx = {name:i for i,name in enumerate(classes)}
-        records = sorted((f'{image_id.split("_",1)[0]}/{image_id}.JPEG',
-                          class_to_idx[image_id.split('_',1)[0]]) for image_id in ids)
-        source = dict(index_source=str(manifest),
-                      manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+        records = sorted((path,class_to_idx[path.split('/')[0]]) for path in paths)
+        source = dict(index_source=str(classification),
+                      manifest_sha256=hashlib.sha256(classification.read_bytes()).hexdigest())
     else:
-        # LOC_train_solution contains only the localization-annotated subset.
-        # NFS can require a stat per file for scandir.is_dir/os.walk. listdir
-        # avoids 1.28 million such calls for the known flat ImageNet layout.
-        print(f'Manifest has {len(ids)} rows; indexing all flat class directories',flush=True)
-        classes = sorted(name for name in os.listdir(root) if re.fullmatch(r'n[0-9]{8}',name))
-        records = []
-        for label,name in enumerate(classes):
-            records.extend((f'{name}/{filename}',label) for filename in sorted(os.listdir(root/name))
-                           if filename.lower().endswith(('.jpeg','.jpg','.png')))
-            if (label+1)%100==0:
-                print(f'Indexed {label+1} classes / {len(records)} images',flush=True)
-        source = dict(index_source='flat class directory listings; full classification set')
+        manifest = root.parents[3]/'LOC_train_solution.csv'
+        source = {}
+        ids = []
+        if manifest.exists():
+            print(f'Indexing ImageNet from {manifest}',flush=True)
+            with manifest.open(newline='') as stream:
+                ids = [row['ImageId'] for row in csv.DictReader(stream)]
+            if len(ids)!=len(set(ids)):
+                raise ValueError('Duplicate image IDs in ImageNet manifest')
+        if len(ids)==expected_count:
+            classes = sorted({image_id.split('_',1)[0] for image_id in ids})
+            class_to_idx = {name:i for i,name in enumerate(classes)}
+            records = sorted((f'{image_id.split("_",1)[0]}/{image_id}.JPEG',
+                              class_to_idx[image_id.split('_',1)[0]]) for image_id in ids)
+            source = dict(index_source=str(manifest),
+                          manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+        else:
+            # LOC_train_solution contains only the localization-annotated subset.
+            # NFS can require a stat per file for scandir.is_dir/os.walk. listdir
+            # avoids 1.28 million such calls for the known flat ImageNet layout.
+            print(f'Manifest has {len(ids)} rows; indexing all flat class directories',flush=True)
+            classes = sorted(name for name in os.listdir(root) if re.fullmatch(r'n[0-9]{8}',name))
+            records = []
+            for label,name in enumerate(classes):
+                records.extend((f'{name}/{filename}',label) for filename in sorted(os.listdir(root/name))
+                               if filename.lower().endswith(('.jpeg','.jpg','.png')))
+                if (label+1)%100==0:
+                    print(f'Indexed {label+1} classes / {len(records)} images',flush=True)
+            source = dict(index_source='flat class directory listings; full classification set')
     if len(classes)!=expected_classes or len(records)!=expected_count:
         raise ValueError(f'Expected full ImageNet train: got {len(classes)} classes, {len(records)} images')
     print(f'Checking source files for {len(records)} indexed images',flush=True)
