@@ -288,6 +288,8 @@ def main():
         write_json(output/'config.json', config)
         write_json(output/'status.json', dict(status='initializing', update=update))
     hardware = dict(rank=rank, gpu=torch.cuda.get_device_name(device),
+        allocated_gpu=os.environ.get('MMD_ALLOCATED_GPU'),
+        cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
         total_memory_bytes=torch.cuda.get_device_properties(device).total_memory,
         capability=torch.cuda.get_device_capability(device), torch=torch.__version__,
         cuda=torch.version.cuda, parameters=parameters)

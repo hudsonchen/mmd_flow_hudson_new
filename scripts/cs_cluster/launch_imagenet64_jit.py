@@ -28,16 +28,14 @@ def main():
     study.mkdir(parents=True,exist_ok=True)
     lock = (study/'worker.lock').open('a')
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    import torch
-    if torch.cuda.device_count()!=3:
-        raise RuntimeError(f'Expected three allocated GPUs, got {torch.cuda.device_count()}')
-    devices = [torch.cuda.get_device_name(i) for i in range(3)]
-    if not all('H100' in name for name in devices):
-        raise RuntimeError(f'Wrong GPUs: {devices}')
+    # Keep the orchestrator free of CUDA contexts on exclusive-process GPUs.
+    devices = os.environ.get('CUDA_VISIBLE_DEVICES','').split(',')
+    if len(devices)!=3 or len(set(devices))!=3:
+        raise RuntimeError(f'Expected three distinct allocated devices, got {devices}')
     tracked = subprocess.check_output(['git','ls-files'],cwd=repo,text=True).splitlines()
     hashes = {p:hashlib.sha256((repo/p).read_bytes()).hexdigest() for p in tracked if (repo/p).is_file()}
     common = [sys.executable,'-u','-m','torch.distributed.run','--standalone','--nproc_per_node=3',
-        str(repo/'scripts/cs_cluster/run_imagenet64_jit.py'),
+        str(repo/'scripts/cs_cluster/jit_rank_entrypoint.py'),
         '--data-root','/SAN/intelsys/imagenet_mmd_flow/ILSVRC/Data/CLS-LOC/train',
         '--epochs','600','--global-batch','1024','--lr','0.0002','--warmup-epochs','5',
         '--time-mean','-0.8','--time-std','0.8','--cfg-dropout','0.1',
@@ -47,7 +45,8 @@ def main():
                     training=common+['--output',str(study/'training')])
     manifest = dict(source=str(repo),source_commit=subprocess.check_output(
         ['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),source_sha256=hashes,
-        job_id=os.environ.get('JOB_ID'),host=os.uname().nodename,devices=devices,
+        job_id=os.environ.get('JOB_ID'),host=os.uname().nodename,allocated_device_ids=devices,
+        nccl_environment={k:v for k,v in os.environ.items() if k.startswith('NCCL_')},
         cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),commands=commands,
         source_transfer='GitHub branch deployment',dataset='ImageNet training RGB center-cropped to 64',
         pure_pixel_training=True,pretrained_encoder=False,initialization='random',
