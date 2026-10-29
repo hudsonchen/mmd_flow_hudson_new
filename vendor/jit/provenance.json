@@ -11,6 +11,7 @@
     "Relative utility import",
     "Remove unconditional torch.compile decorators",
     "Allocate attention bias on query device",
-    "Register RoPE tensors as nonpersistent buffers for CPU/device movement"
+    "Register RoPE tensors as nonpersistent buffers for CPU/device movement",
+    "Optional non-reentrant activation checkpointing around transformer blocks; architecture and weights unchanged"
   ]
 }

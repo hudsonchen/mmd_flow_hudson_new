@@ -347,7 +347,12 @@ class JiT(nn.Module):
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
                 x = torch.cat([in_context_tokens, x], dim=1)
-            x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
+            rope = self.feat_rope if i < self.in_context_start else self.feat_rope_incontext
+            if getattr(self, 'gradient_checkpointing', False) and self.training and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(block, x, c, rope, use_reentrant=False)
+            else:
+                x = block(x, c, rope)
 
         x = x[:, self.in_context_len:]
 

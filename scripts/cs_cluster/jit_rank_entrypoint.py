@@ -13,8 +13,9 @@ import sys
 def main():
     devices = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
     slot = int(os.environ['LOCAL_RANK'])
-    if len(devices)!=3 or not 0<=slot<3:
-        raise RuntimeError('Expected a three-GPU allocation before worker isolation')
+    world = int(os.environ['WORLD_SIZE'])
+    if len(devices)!=world or not 0<=slot<world:
+        raise RuntimeError('Allocation must match the requested worker count')
     os.environ['MMD_ALLOCATION_LOCAL_RANK']=str(slot)
     os.environ['MMD_ALLOCATED_GPU']=devices[slot]
     os.environ['CUDA_VISIBLE_DEVICES']=devices[slot]

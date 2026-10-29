@@ -1,4 +1,4 @@
-"""ImageNet64 JiT direct-velocity Riesz with three globally interacting GPU ranks."""
+"""ImageNet64 JiT direct-velocity Riesz with globally interacting GPU ranks and selectable prediction space."""
 import argparse
 import copy
 import datetime
@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from imagenet64_jit import JiTVelocity, sample_time, learning_rate, sample_velocity
+from imagenet64_jit import JiTVelocity, sample_time, learning_rate, sample_velocity, sampling_nfe
 from imagenet64_data import build_index, ImageNet64, RandomImageBatches
 from torch.utils.data import DataLoader, Subset
 from cifar_riesz_velocity import global_particle_loss
@@ -101,7 +101,7 @@ def preview(ema, output, update, args, device):
         write_json(output/f'preview_{update:07d}.json', dict(update=update, count=len(raw),
             solver=args.solver, grid='uniform', steps=args.sample_steps,cfg=args.cfg,
             cfg_interval=[args.cfg_min_time,args.cfg_max_time],
-            nfe=args.sample_steps*(2 if args.solver=='heun' else 1), seed=8765432,
+            nfe=sampling_nfe(args.sample_steps,args.solver,args.prediction), seed=8765432,
             raw_pixel_variance=float(raw.var(0).mean()),
             raw_pixel_outside_fraction=float((raw.abs()>1).float().mean())))
     dist.barrier()
@@ -160,7 +160,7 @@ def evaluate(ema, inception, reference, output, update, args, device, intervals=
             reference_path=str(args.fid_reference) if args.fid_reference else str(output/'fid_reference.npz'),
             reference_sha256=args.fid_reference_sha256,
             cfg=args.cfg,cfg_interval=[args.cfg_min_time,args.cfg_max_time],class_labels='balanced modulo 1000',
-            solver=args.solver, grid='uniform', steps=intervals, nfe=intervals*(2 if args.solver=='heun' else 1),
+            solver=args.solver, grid='uniform', steps=intervals, nfe=sampling_nfe(intervals,args.solver,args.prediction),
             raw_pixel_outside_fraction=int(tally)/(stats[2]*12288),
             evaluation_seconds=time.monotonic()-started,
             preprocessing='unquantized float [0,1], same Inception as Riesz and DDPM')
@@ -178,6 +178,11 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--data-root', type=Path, required=True)
     p.add_argument('--epochs', type=int, default=600)
+    p.add_argument('--patch-size', type=int, choices=[4,16], default=16)
+    p.add_argument('--prediction', choices=['velocity','x'], default='velocity')
+    p.add_argument('--denominator-floor', type=float, default=.05)
+    p.add_argument('--gradient-checkpointing', action='store_true')
+    p.add_argument('--expected-world-size', type=int, default=3)
     p.add_argument('--global-batch', type=int, default=1024)
     p.add_argument('--lr', type=float, default=2e-4)
     p.add_argument('--warmup-epochs', type=float, default=5.)
@@ -234,8 +239,8 @@ def main():
     if args.eval_every % 1000:p.error('FID cadence must align with recovery checkpoints')
     rank = int(os.environ['RANK']); local_rank = int(os.environ['LOCAL_RANK'])
     world = int(os.environ['WORLD_SIZE'])
-    if world != 3:
-        raise ValueError('This experiment requires exactly three GPUs')
+    if world != args.expected_world_size or world < 1 or args.global_batch < world:
+        raise ValueError('Worker count must match the requested GPU allocation and batch')
     batch_sizes = [args.global_batch//world+int(i<args.global_batch%world) for i in range(world)]
     local_batch = batch_sizes[rank]
     torch.cuda.set_device(local_rank)
@@ -250,7 +255,8 @@ def main():
             raise ValueError('Existing training output requires --resume')
     dist.barrier()
     torch.manual_seed(args.seed)
-    model = JiTVelocity().to(device)
+    model = JiTVelocity(args.patch_size, args.prediction, args.denominator_floor,
+                       args.gradient_checkpointing).to(device)
     parameters = sum(v.numel() for v in model.parameters())
     ddp = DDP(model, device_ids=[local_rank], broadcast_buffers=False,
               gradient_as_bucket_view=True)
@@ -265,16 +271,17 @@ def main():
               if k not in ('resume','allow_evaluation_change')}
     config.update(parameters=parameters, world_size=world, global_batch=global_batch, rank_batch_sizes=batch_sizes,
         epoch_definition='1281167 sampled training images per dataset-equivalent epoch, class batches with replacement',
-        objective='coupled', parameterization='velocity', architecture='JiT-B/16', dataset='imagenet64', initialization='random',
+        objective='coupled', parameterization=args.prediction, architecture=f'JiT-B/{args.patch_size}', dataset='imagenet64', initialization='random',
+        velocity_conversion='(x_hat-x_t)/max(1-t,denominator_floor)' if args.prediction=='x' else 'direct network output',
         time_sampling='jit_logit_normal', shared_time_across_all_ranks=True,
         time_distribution=f'sigmoid({args.time_mean}+{args.time_std}*N(0,1)), clipped to [0.0001,0.999]',
         path='x_t=(1-t)*noise+t*image; prediction=x_t+h*v_theta; target=x_(t+h)',
         time_embedding='raw t as official JiT', optimizer='Adam beta=(0.9,0.95), eps=1e-8, weight_decay=0; linear warmup then constant',
         peak_learning_rate=peak_lr, ema=args.ema_decay, precision='bfloat16 network; float32 Riesz field',
-        image_size=64, patch_size=16, image_tokens=16, in_context_tokens=32,
+        image_size=64, image_tokens=(64//args.patch_size)**2, in_context_tokens=32,
         backbone_source='LTH14/JiT@cbc743a2ada5e9762697da2c83f8c4f8379e8c17',
         conditioning='class-matched Riesz batches; CFG dropout per global interaction batch; dropped batches sample all classes',
-        sampling=f'{args.sample_steps} uniform {args.solver} steps; {args.sample_steps*(2 if args.solver=="heun" else 1)} network calls',
+        sampling=f'{args.sample_steps} uniform {args.solver} intervals; {sampling_nfe(args.sample_steps,args.solver,args.prediction)} velocity evaluations; final Euler for x-prediction',
         normalization='none', affinity='row-column', reference_coupling='paired', include_self_negative=True,
         feature_space='pixels', prime_steps=0, fork=None,
         training_rule='global paired pixel Riesz; sum power-kernel fields; no velocity MSE',
