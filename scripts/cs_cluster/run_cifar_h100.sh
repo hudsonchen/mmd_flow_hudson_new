@@ -7,8 +7,10 @@
 #$ -pe gpu 1
 #$ -l tmem=32G,h_rt=48:00:00,gpu=true,gpu_type=h100
 #$ -j y
-#$ -o /home/zongchen/
+#$ -o /SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/
 set -euo pipefail
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd -P)}"
+cd "$PROJECT_ROOT"
 [[ -f "$PWD/main.py" && -f "$PWD/run.sh" ]] || { echo 'Submit from the project root containing main.py and run.sh.' >&2; exit 1; }
 export PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
 export DATA_ROOT="${DATA_ROOT:-/SAN/intelsys/imagenet_mmd_flow/data}"
@@ -16,7 +18,7 @@ MULTISCALE_LOSS="${MULTISCALE_LOSS:-0}"
 export MULTISCALE_LOSS
 LOSS_NAME=""
 if [[ "$MULTISCALE_LOSS" == 1 ]]; then LOSS_NAME="_multiscale"; fi
-export OUTPUT="$PWD/results/cifar/h100_ddpmpp_ema0999${LOSS_NAME}_${JOB_ID}"
+export OUTPUT="$PROJECT_ROOT/results/cifar/h100_ddpmpp_ema0999${LOSS_NAME}_${JOB_ID}"
 export EMA_DECAY=0.999 EPOCHS=2000 SAVE_EVERY=20 PARTICLES=64 BATCH_SIZE=256
 export DATASET=cifar10 ARCHITECTURE=unet OBJECTIVE=softmax-riesz
 export BASE_CHANNELS=128 NUM_RES_BLOCKS=4 LATENT_DIM=3072 LEARNING_RATE=0.0002 SEED=0

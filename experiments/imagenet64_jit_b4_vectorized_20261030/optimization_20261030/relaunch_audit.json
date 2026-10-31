@@ -1,0 +1,164 @@
+{
+  "state": "running_verified",
+  "created_at": "2026-10-30T15:52:54.968012+00:00",
+  "old_job": "7659997",
+  "checkpoint_update": 20000,
+  "checkpoint_sha256": "25894af4f0f365a98c1efbb72d9b8154b84b5194ae40b0f86531c413f8718a59",
+  "source_manifest_sha256": "659674d646842a04ca49873d8c3cb245f19263e9eff5fe219e47cb37ea17ec92",
+  "prior_status": {
+    "status": "running",
+    "update": 21100,
+    "loss": 99.1341781616211,
+    "grad": 0.11034499853849411,
+    "lr": 0.0002,
+    "time": 0.23708221316337585,
+    "label": 354,
+    "epoch": 16.864624205899776,
+    "seconds": 52506.66434065439,
+    "world_size": 4,
+    "peak_memory_gb": 11.918063104,
+    "amp_scale": 1.0,
+    "overflow_attempts": 0
+  },
+  "local_tests_passed": 37,
+  "protected_source_hashes": {
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source/riesz_loss.py": "24fe7e4fe3ee889cbfebb64c14e62e6231a8cd25f2d3fe8bbf760ef9a0d00628",
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source/training_objectives.py": "390c9a34ca760d7245ed581b54132f54ed1d4f4103c8a44573dc5ecd190e8e47",
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz/vectorized_20261030/source/riesz_loss.py": "2efa10717271f4ded76ecbc0bdca365ae67bde3cb9d178a3a342207d5222c37c",
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz/vectorized_deployment.json": "622532052c784eb5dd1a45838f33154f02cff1089444ce98d354bdb7d5d4277c"
+  },
+  "four_gpu_validation_required": true,
+  "fallback_source": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/imagenet64/jit_b4_xpred_4h100_20261029/checkpoint10k_source",
+  "new_job": "7661969",
+  "submitted_at": "2026-10-30T15:54:04.341866+00:00",
+  "stop_stdout": "zongchen has registered the job 7659997 for deletion\n",
+  "release_stdout": "modified hold of job 7661969\n",
+  "four_gpu_benchmark_passed": true,
+  "verified_at": "2026-10-30T15:58:11.326209+00:00",
+  "live_verification": {
+    "checked_at": "2026-10-30T15:58:11.326209+00:00",
+    "job_id": "7661969",
+    "status": {
+      "status": "running",
+      "update": 20100,
+      "loss": 100.65333557128906,
+      "grad": 0.1830805093050003,
+      "lr": 0.0002,
+      "time": 0.23237188160419464,
+      "label": 604,
+      "epoch": 16.06535291652064,
+      "seconds": 82.54062977991998,
+      "world_size": 4,
+      "peak_memory_gb": 11.827731456,
+      "amp_scale": 1.0,
+      "overflow_attempts": 0
+    },
+    "first_resumed_status": {
+      "status": "running",
+      "update": 20001,
+      "loss": 84.06550598144531,
+      "grad": 0.07072046399116516,
+      "lr": 0.0002,
+      "time": 0.34626054763793945,
+      "label": 330,
+      "epoch": 15.986225058872106,
+      "seconds": 6.404297876171768,
+      "world_size": 4,
+      "peak_memory_gb": 11.826503168,
+      "amp_scale": 1.0,
+      "overflow_attempts": 0
+    },
+    "continuation": {
+      "checkpoint": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/imagenet64/jit_b4_xpred_4h100_20261029/vectorized_20261030/resume_checkpoint.pt",
+      "update": 20000,
+      "evaluation_changed": false,
+      "best_fid_reset": false,
+      "optimizer_and_rng_restored": true
+    },
+    "configuration_identical": true,
+    "production_seconds_per_update": 0.7690538576136183,
+    "matched_replayed_time_and_label": {
+      "time": true,
+      "label": true
+    },
+    "benchmark_speedup": 3.806777332930794,
+    "scheduler_states": {
+      "7659961": {
+        "state": "r",
+        "slots": "1"
+      },
+      "7661942": {
+        "state": "r",
+        "slots": "1"
+      },
+      "7661955": {
+        "state": "r",
+        "slots": "1"
+      },
+      "7661969": {
+        "state": "r",
+        "slots": "4"
+      }
+    },
+    "protected_tiny_sources_unchanged": true,
+    "old_job_stopped": true,
+    "hardware": [
+      {
+        "rank": 0,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "allocated_gpu": "2",
+        "cuda_visible_devices": "2",
+        "total_memory_bytes": 84929347584,
+        "capability": [
+          9,
+          0
+        ],
+        "torch": "2.6.0+cu124",
+        "cuda": "12.4",
+        "parameters": 130674480
+      },
+      {
+        "rank": 1,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "allocated_gpu": "3",
+        "cuda_visible_devices": "3",
+        "total_memory_bytes": 84929347584,
+        "capability": [
+          9,
+          0
+        ],
+        "torch": "2.6.0+cu124",
+        "cuda": "12.4",
+        "parameters": 130674480
+      },
+      {
+        "rank": 2,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "allocated_gpu": "4",
+        "cuda_visible_devices": "4",
+        "total_memory_bytes": 84929347584,
+        "capability": [
+          9,
+          0
+        ],
+        "torch": "2.6.0+cu124",
+        "cuda": "12.4",
+        "parameters": 130674480
+      },
+      {
+        "rank": 3,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "allocated_gpu": "5",
+        "cuda_visible_devices": "5",
+        "total_memory_bytes": 84929347584,
+        "capability": [
+          9,
+          0
+        ],
+        "torch": "2.6.0+cu124",
+        "cuda": "12.4",
+        "parameters": 130674480
+      }
+    ]
+  }
+}

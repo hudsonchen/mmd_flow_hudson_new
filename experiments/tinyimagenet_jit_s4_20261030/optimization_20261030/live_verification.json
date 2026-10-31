@@ -1,0 +1,53 @@
+{
+  "checked_at": "2026-10-30T15:46:32.444008+00:00",
+  "job_id": "7661942",
+  "status": {
+    "status": "running",
+    "update": 14100,
+    "objective": "riesz",
+    "training_seconds": 137.59595850482583,
+    "loss": 68.31391143798828,
+    "grad": 0.19457542896270752,
+    "lr": 0.0002,
+    "time": 0.41267165541648865,
+    "label": 181,
+    "epoch": 144.384,
+    "seconds": 137.8391844900325,
+    "world_size": 1,
+    "peak_memory_gb": 18.80107776,
+    "amp_scale": 1.0,
+    "overflow_attempts": 0
+  },
+  "continuation": {
+    "checkpoint": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz/vectorized_20261030/resume_checkpoint.pt",
+    "update": 14000,
+    "evaluation_changed": false,
+    "best_fid_reset": false,
+    "optimizer_and_rng_restored": true
+  },
+  "configuration_identical": true,
+  "production_seconds_per_update": 1.3759595850482582,
+  "scheduler_states": {
+    "7620408": "r",
+    "7659961": "r",
+    "7659997": "r",
+    "7661930": "r",
+    "7661942": "r"
+  },
+  "protected_sources_unchanged": true,
+  "old_job_stopped": true,
+  "hardware": {
+    "rank": 0,
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "allocated_gpu": "1",
+    "cuda_visible_devices": "1",
+    "total_memory_bytes": 84929347584,
+    "capability": [
+      9,
+      0
+    ],
+    "torch": "2.6.0+cu124",
+    "cuda": "12.4",
+    "parameters": 32741040
+  }
+}

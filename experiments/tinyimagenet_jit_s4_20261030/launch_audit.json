@@ -1,0 +1,134 @@
+{
+  "checked_at": "2026-10-30T00:49:10.360647+00:00",
+  "jobs": {
+    "riesz": {
+      "job_id": "7659960",
+      "hardware": {
+        "rank": 0,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "allocated_gpu": "1",
+        "cuda_visible_devices": "1",
+        "total_memory_bytes": 84929347584,
+        "capability": [
+          9,
+          0
+        ],
+        "torch": "2.6.0+cu124",
+        "cuda": "12.4",
+        "parameters": 32741040,
+        "passed": true,
+        "optimizer_updates": 3,
+        "global_batch": 1024,
+        "batch_per_rank": 1024,
+        "parameter_max_difference": 0.0,
+        "peak_memory_gb": 18.793278976,
+        "seconds": 23.531262539327145,
+        "finite_sampler_and_inception": true,
+        "checkpoint_roundtrip": true,
+        "amp_overflows": 0,
+        "full_fid_pipeline_passed": true,
+        "smoke_fid_not_quality_metric": 495.2160893724897
+      },
+      "status": {
+        "status": "running",
+        "update": 3,
+        "objective": "riesz",
+        "training_seconds": 10.73664896376431,
+        "loss": 18.025039672851562,
+        "grad": 1.665872573852539,
+        "lr": 1.2288e-06,
+        "time": 0.6410241723060608,
+        "label": 123,
+        "epoch": 0.03072,
+        "seconds": 10.758114962372929,
+        "world_size": 1,
+        "peak_memory_gb": 18.794245632,
+        "amp_scale": 1.0,
+        "overflow_attempts": 0
+      },
+      "initialization": {
+        "seed": 0,
+        "parameters": 32741040,
+        "state_sha256": "7f51c01936650b8309a15034d616abb23c6c9c44a917f66e8c32abe300bd206f",
+        "random_initialization": true
+      },
+      "checkpoint_bytes": 523376250
+    },
+    "flow_matching": {
+      "job_id": "7659961",
+      "hardware": {
+        "rank": 0,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "allocated_gpu": "0",
+        "cuda_visible_devices": "0",
+        "total_memory_bytes": 84929347584,
+        "capability": [
+          9,
+          0
+        ],
+        "torch": "2.6.0+cu124",
+        "cuda": "12.4",
+        "parameters": 32741040,
+        "passed": true,
+        "optimizer_updates": 3,
+        "global_batch": 1024,
+        "batch_per_rank": 1024,
+        "parameter_max_difference": 0.0,
+        "peak_memory_gb": 18.793278976,
+        "seconds": 13.340313422027975,
+        "finite_sampler_and_inception": true,
+        "checkpoint_roundtrip": true,
+        "amp_overflows": 0,
+        "full_fid_pipeline_passed": true,
+        "smoke_fid_not_quality_metric": 495.22159374959745
+      },
+      "status": {
+        "status": "running",
+        "update": 3,
+        "objective": "flow_matching",
+        "training_seconds": 4.262053990736604,
+        "loss": 2.8034534454345703,
+        "grad": 7.806884288787842,
+        "lr": 1.2288e-06,
+        "time": 0.6410241723060608,
+        "label": 123,
+        "epoch": 0.03072,
+        "seconds": 4.286179326009005,
+        "world_size": 1,
+        "peak_memory_gb": 18.794245632,
+        "amp_scale": 1.0,
+        "overflow_attempts": 0
+      },
+      "initialization": {
+        "seed": 0,
+        "parameters": 32741040,
+        "state_sha256": "7f51c01936650b8309a15034d616abb23c6c9c44a917f66e8c32abe300bd206f",
+        "random_initialization": true
+      },
+      "checkpoint_bytes": 523376250
+    }
+  },
+  "passed": true,
+  "config_differences": {
+    "objective": [
+      "riesz",
+      "flow_matching"
+    ],
+    "output": [
+      "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz/training",
+      "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/flow_matching/training"
+    ],
+    "lineage_has_flow_matching": [
+      false,
+      true
+    ],
+    "training_rule": [
+      "global paired pixel Riesz; unchanged power-kernel fields; no velocity MSE",
+      "conditional velocity MSE; no Riesz term"
+    ]
+  },
+  "identical_initialization": true,
+  "same_dataset": true,
+  "frozen_source_verified": true,
+  "scheduler": "job-ID  prior   name       user         state submit/start at     queue                          slots ja-task-ID \n-----------------------------------------------------------------------------------------------------------------\n7620408 0.50106 c10_ddpm_t zongchen     r     10/26/2026 21:35:30 gpu.q@webb.local                   1        \n7659554 0.50285 in64_b4_xp zongchen     r     10/29/2026 21:54:35 gpu.q@seymour3.local               4        \n7659589 0.50285 c10_ddpm_l zongchen     r     10/29/2026 22:10:35 gpu.q@brooks.local                 1 2\n7659589 0.50285 c10_ddpm_l zongchen     r     10/29/2026 22:17:35 gpu.q@strangepork-205-4.local      1 3\n7659589 0.50285 c10_ddpm_l zongchen     r     10/29/2026 23:20:35 gpu.q@strangepork-205-4.local      1 4\n7659960 0.50285 tiny_riesz zongchen     r     10/30/2026 00:47:35 gpu.q@seymour3.local               1        \n7659961 0.50285 tiny_fm_s4 zongchen     r     10/30/2026 00:47:35 gpu.q@seymour3.local               1        \n"
+}

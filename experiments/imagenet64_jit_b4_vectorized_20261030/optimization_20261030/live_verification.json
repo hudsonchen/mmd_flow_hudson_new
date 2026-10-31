@@ -1,0 +1,126 @@
+{
+  "checked_at": "2026-10-30T15:58:11.326209+00:00",
+  "job_id": "7661969",
+  "status": {
+    "status": "running",
+    "update": 20100,
+    "loss": 100.65333557128906,
+    "grad": 0.1830805093050003,
+    "lr": 0.0002,
+    "time": 0.23237188160419464,
+    "label": 604,
+    "epoch": 16.06535291652064,
+    "seconds": 82.54062977991998,
+    "world_size": 4,
+    "peak_memory_gb": 11.827731456,
+    "amp_scale": 1.0,
+    "overflow_attempts": 0
+  },
+  "first_resumed_status": {
+    "status": "running",
+    "update": 20001,
+    "loss": 84.06550598144531,
+    "grad": 0.07072046399116516,
+    "lr": 0.0002,
+    "time": 0.34626054763793945,
+    "label": 330,
+    "epoch": 15.986225058872106,
+    "seconds": 6.404297876171768,
+    "world_size": 4,
+    "peak_memory_gb": 11.826503168,
+    "amp_scale": 1.0,
+    "overflow_attempts": 0
+  },
+  "continuation": {
+    "checkpoint": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/imagenet64/jit_b4_xpred_4h100_20261029/vectorized_20261030/resume_checkpoint.pt",
+    "update": 20000,
+    "evaluation_changed": false,
+    "best_fid_reset": false,
+    "optimizer_and_rng_restored": true
+  },
+  "configuration_identical": true,
+  "production_seconds_per_update": 0.7690538576136183,
+  "matched_replayed_time_and_label": {
+    "time": true,
+    "label": true
+  },
+  "benchmark_speedup": 3.806777332930794,
+  "scheduler_states": {
+    "7659961": {
+      "state": "r",
+      "slots": "1"
+    },
+    "7661942": {
+      "state": "r",
+      "slots": "1"
+    },
+    "7661955": {
+      "state": "r",
+      "slots": "1"
+    },
+    "7661969": {
+      "state": "r",
+      "slots": "4"
+    }
+  },
+  "protected_tiny_sources_unchanged": true,
+  "old_job_stopped": true,
+  "hardware": [
+    {
+      "rank": 0,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "2",
+      "cuda_visible_devices": "2",
+      "total_memory_bytes": 84929347584,
+      "capability": [
+        9,
+        0
+      ],
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "parameters": 130674480
+    },
+    {
+      "rank": 1,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "3",
+      "cuda_visible_devices": "3",
+      "total_memory_bytes": 84929347584,
+      "capability": [
+        9,
+        0
+      ],
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "parameters": 130674480
+    },
+    {
+      "rank": 2,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "4",
+      "cuda_visible_devices": "4",
+      "total_memory_bytes": 84929347584,
+      "capability": [
+        9,
+        0
+      ],
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "parameters": 130674480
+    },
+    {
+      "rank": 3,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "5",
+      "cuda_visible_devices": "5",
+      "total_memory_bytes": 84929347584,
+      "capability": [
+        9,
+        0
+      ],
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "parameters": 130674480
+    }
+  ]
+}

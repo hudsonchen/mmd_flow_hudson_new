@@ -1,0 +1,24 @@
+{
+  "local_tests": 9,
+  "passed": true,
+  "command": "python -m unittest discover -s tests -v",
+  "reference_sha256": "24fe7e4fe3ee889cbfebb64c14e62e6231a8cd25f2d3fe8bbf760ef9a0d00628",
+  "scope": "Tiny ImageNet Riesz only; ImageNet64 and flow matching excluded",
+  "gpu_benchmark": "optimization_20261030/benchmark.json",
+  "gpu_benchmark_passed": true,
+  "speedup": 2.5724259402871636,
+  "model_gradient_relative_l2": 0.0006715096597897611,
+  "max_field_relative_l2": 0.0001298816189854225,
+  "local_source_hashes_verified": true,
+  "assets_verified_remotely": [
+    "assets/pt_inception-2015-12-05-6726825d.pth"
+  ],
+  "new_job": "7661942",
+  "resume_update": 14000,
+  "live_resume_verified": true,
+  "live_verification": "optimization_20261030/live_verification.json",
+  "verified_update": 14100,
+  "production_seconds_per_update": 1.3759595850482582,
+  "protected_runs_unchanged": true,
+  "checked_at": "2026-10-30T15:46:32.444008+00:00"
+}

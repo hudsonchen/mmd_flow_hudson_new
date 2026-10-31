@@ -9,9 +9,9 @@
 #$ -pe gpu 1
 #$ -l tmem=32G,h_rt=48:00:00,gpu=true,gpu_type=h100
 #$ -j y
-#$ -o /home/zongchen/
+#$ -o /SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/
 set -euo pipefail
-PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd -P)}"
 PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
 DATA_ROOT="${DATA_ROOT:-/SAN/intelsys/imagenet_mmd_flow/data}"
 case "${SGE_TASK_ID:?Expected array task 1, 2, or 3}" in
@@ -20,7 +20,7 @@ case "${SGE_TASK_ID:?Expected array task 1, 2, or 3}" in
     3) OBJECTIVE=softmax-riesz ;;
     *) exit 2 ;;
 esac
-OUTPUT_ROOT="${OUTPUT_ROOT:-/home/zongchen/mmd_flow_hudson_new/results/cifar}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/results/cifar}"
 OUTPUT="$OUTPUT_ROOT/officialB_cifar_${JOB_ID:-dryrun}_${SGE_TASK_ID}_${OBJECTIVE}"
 GUIDANCE_ARGS=(--field-step 1)
 if [[ "${CFG:-0}" == 1 ]]; then

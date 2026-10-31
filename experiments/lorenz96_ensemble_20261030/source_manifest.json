@@ -1,0 +1,17 @@
+{
+  "base_commit": "e0c2e61bdf7434809afec125e98afffefdfa066d",
+  "original_riesz_source": "experiments/tinyimagenet_jit_s4_20261030/riesz_loss.py",
+  "sha256": {
+    "DRIFTING_LICENSE.txt": "d91fede4cb730000a54a5d41a75b5b1a3834adda36278d5140538f937809173c",
+    "README.md": "62253771a41a89067d6eb384dbc82bbb7b4cda0d7f593b4d5b097b15a93d9fd5",
+    "SOFTMAX_RIESZ_LICENSE.txt": "ee12cc1a4b06a05a337d9fb70b72867afaed7072d6ead0dfd3f64fd2249e3c12",
+    "config.json": "aa8d224c65b2d68f8c619e4e56ec4a7429f6d28da143df2474a1106b510a8887",
+    "core.py": "75cafedba284c49e4d16a3d094c99d2d29a91ccdacf9d16e87036f2d7ed63319",
+    "original_riesz.py": "2efa10717271f4ded76ecbc0bdca365ae67bde3cb9d178a3a342207d5222c37c",
+    "run_cluster.sh": "a3226d16f19887e3195e44771adecf66ab91807a54c83aa792741c5d80eac20f",
+    "study.py": "baa14c70c4dc397c0dbbe1d16caaa2c44f197a724e479436952de5a99cb32263",
+    "test_science.py": "64408581d42bb9d44e3382e914bd1c31338b101336da4091fe98e18348d9f613"
+  },
+  "revision": 3,
+  "revision_reason": "Retain zero-time initialization checkpoint for exact handling of budgets below first saved update"
+}

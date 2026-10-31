@@ -1,0 +1,32 @@
+{
+  "local_tests": 37,
+  "local_tests_passed": true,
+  "command": "PYTHONPATH=. python -m unittest discover -s tests -v",
+  "optimized_loss_sha256": "2efa10717271f4ded76ecbc0bdca365ae67bde3cb9d178a3a342207d5222c37c",
+  "four_gpu_benchmark": "optimization_20261030/benchmark.json",
+  "scope": "ImageNet64 B/4 only; both Tiny ImageNet jobs excluded",
+  "source_hashes_verified": true,
+  "remote_only_assets": [
+    "assets/pt_inception-2015-12-05-6726825d.pth"
+  ],
+  "new_job": "7661969",
+  "resume_update": 20000,
+  "checkpoint_sha256": "25894af4f0f365a98c1efbb72d9b8154b84b5194ae40b0f86531c413f8718a59",
+  "four_gpu_benchmark_passed": true,
+  "benchmark_speedup": 3.806777332930794,
+  "benchmark_seconds_per_step": 0.7578323765192181,
+  "max_field_relative_l2": 6.54077181327977e-05,
+  "ddp_model_gradient_relative_l2": 0.0003071294601477678,
+  "ddp_parameter_max_difference": 0.0,
+  "live_resume_verified": true,
+  "live_verification": "optimization_20261030/live_verification.json",
+  "production_seconds_per_update": 0.7690538576136183,
+  "verified_update": 20100,
+  "configuration_identical": true,
+  "tiny_jobs_unchanged": true,
+  "matched_replayed_time_and_label": {
+    "time": true,
+    "label": true
+  },
+  "checked_at": "2026-10-30T15:58:11.326209+00:00"
+}

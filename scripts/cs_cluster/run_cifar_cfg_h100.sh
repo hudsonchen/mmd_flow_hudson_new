@@ -9,8 +9,8 @@
 #$ -pe gpu 1
 #$ -l tmem=32G,h_rt=48:00:00,gpu=true,gpu_type=h100
 #$ -j y
-#$ -o /home/zongchen/
+#$ -o /SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/
 set -euo pipefail
 export CFG=1
-PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd -P)}"
 exec bash "$PROJECT_ROOT/scripts/cs_cluster/run_cifar_official_b_h100.sh" "$@"

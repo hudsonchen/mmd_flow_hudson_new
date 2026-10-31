@@ -1,0 +1,40 @@
+{
+  "submitted_at": "2026-10-30T00:47:23.074094+00:00",
+  "source": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source",
+  "jobs": {
+    "riesz": {
+      "job_id": "7659960",
+      "output": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz",
+      "command": [
+        "qsub",
+        "-terse",
+        "-N",
+        "tiny_riesz_s4",
+        "-o",
+        "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz/scheduler.log",
+        "-v",
+        "SOURCE_DIR=/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source,STUDY=/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz,OBJECTIVE=riesz,DATA_ROOT=/SAN/intelsys/imagenet_mmd_flow/data/tinyimagenet/tiny-imagenet-200",
+        "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source/scripts/cs_cluster/run_tinyimagenet_h100.sh"
+      ],
+      "requested_gpus": 1,
+      "gpu_type": "h100"
+    },
+    "flow_matching": {
+      "job_id": "7659961",
+      "output": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/flow_matching",
+      "command": [
+        "qsub",
+        "-terse",
+        "-N",
+        "tiny_fm_s4",
+        "-o",
+        "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/flow_matching/scheduler.log",
+        "-v",
+        "SOURCE_DIR=/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source,STUDY=/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/flow_matching,OBJECTIVE=flow_matching,DATA_ROOT=/SAN/intelsys/imagenet_mmd_flow/data/tinyimagenet/tiny-imagenet-200",
+        "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source/scripts/cs_cluster/run_tinyimagenet_h100.sh"
+      ],
+      "requested_gpus": 1,
+      "gpu_type": "h100"
+    }
+  }
+}

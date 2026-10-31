@@ -1,0 +1,8 @@
+{
+  "cpu_tests": "5 passed",
+  "parameter_count": 32741040,
+  "loss_and_gradient_parity": "exact at t=.001,.77,.999",
+  "loss_source_unchanged": true,
+  "architecture": "custom JiT-S/4",
+  "tested_python": "/home/zongchen/miniconda3/envs/mmd_flow_hudson/bin/python"
+}

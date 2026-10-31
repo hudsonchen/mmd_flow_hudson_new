@@ -1,0 +1,89 @@
+{
+  "created_at": "2026-10-30T15:43:19.563867+00:00",
+  "old_job": "7659960",
+  "new_job": "7661942",
+  "checkpoint_update": 14000,
+  "checkpoint_sha256": "0b0ce32ba3bacaa3cd1af95c2c7fd264cfdc91fdf7295dc012c9da6010ebf45d",
+  "benchmark_passed": true,
+  "prior_status": {
+    "status": "running",
+    "update": 14800,
+    "objective": "riesz",
+    "training_seconds": 51481.32917637611,
+    "loss": 107.54644012451172,
+    "grad": 0.3280334770679474,
+    "lr": 0.0002,
+    "time": 0.18105679750442505,
+    "label": 52,
+    "epoch": 151.552,
+    "seconds": 53470.70411812328,
+    "world_size": 1,
+    "peak_memory_gb": 18.882441216,
+    "amp_scale": 1.0,
+    "overflow_attempts": 0
+  },
+  "source_manifest_sha256": "a8298c4a48b05bdfccdcb2d3615c137750180e0f18f41d94d5484c8efc64d67e",
+  "protected_source_hashes": {
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source/riesz_loss.py": "24fe7e4fe3ee889cbfebb64c14e62e6231a8cd25f2d3fe8bbf760ef9a0d00628",
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source/training_objectives.py": "390c9a34ca760d7245ed581b54132f54ed1d4f4103c8a44573dc5ecd190e8e47",
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/source/scripts/cs_cluster/run_imagenet64_jit.py": "06fc098d6ad40b873d74416a49a44b8f1e7b91876e2f09ca1ebc8dae9d19d2bc",
+    "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/imagenet64/jit_b4_xpred_4h100_20261029/checkpoint10k_source/riesz_loss.py": "24fe7e4fe3ee889cbfebb64c14e62e6231a8cd25f2d3fe8bbf760ef9a0d00628"
+  },
+  "state": "running_verified",
+  "stop_stdout": "zongchen has registered the job 7659960 for deletion\n",
+  "release_stdout": "modified hold of job 7661942\n",
+  "verified_at": "2026-10-30T15:46:32.444008+00:00",
+  "live_verification": {
+    "checked_at": "2026-10-30T15:46:32.444008+00:00",
+    "job_id": "7661942",
+    "status": {
+      "status": "running",
+      "update": 14100,
+      "objective": "riesz",
+      "training_seconds": 137.59595850482583,
+      "loss": 68.31391143798828,
+      "grad": 0.19457542896270752,
+      "lr": 0.0002,
+      "time": 0.41267165541648865,
+      "label": 181,
+      "epoch": 144.384,
+      "seconds": 137.8391844900325,
+      "world_size": 1,
+      "peak_memory_gb": 18.80107776,
+      "amp_scale": 1.0,
+      "overflow_attempts": 0
+    },
+    "continuation": {
+      "checkpoint": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz/vectorized_20261030/resume_checkpoint.pt",
+      "update": 14000,
+      "evaluation_changed": false,
+      "best_fid_reset": false,
+      "optimizer_and_rng_restored": true
+    },
+    "configuration_identical": true,
+    "production_seconds_per_update": 1.3759595850482582,
+    "scheduler_states": {
+      "7620408": "r",
+      "7659961": "r",
+      "7659997": "r",
+      "7661930": "r",
+      "7661942": "r"
+    },
+    "protected_sources_unchanged": true,
+    "old_job_stopped": true,
+    "hardware": {
+      "rank": 0,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "1",
+      "cuda_visible_devices": "1",
+      "total_memory_bytes": 84929347584,
+      "capability": [
+        9,
+        0
+      ],
+      "torch": "2.6.0+cu124",
+      "cuda": "12.4",
+      "parameters": 32741040
+    }
+  }
+}

@@ -1,0 +1,165 @@
+"""CIFAR-10 DDPM++ U-Net used by the velocity Riesz model.
+
+Blocks/topology adapted from yang-song/score_sde_pytorch, Copyright 2020
+The Google Research Authors (Apache-2.0; assets/SCORE_SDE_LICENSE).
+Uses PyTorch SDPA attention and an unrestricted time-conditioned output.
+"""
+import math
+import torch
+
+
+def ddpm_conv(in_channels, out_channels, kernel_size=3, init_scale=1.0):
+    """DDPM fan-average uniform initialization, including its near-zero branches."""
+    conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size,
+                           padding=kernel_size // 2)
+    scale = 1e-10 if init_scale == 0 else init_scale
+    bound = math.sqrt(3 * scale / ((in_channels + out_channels) * kernel_size ** 2 / 2))
+    torch.nn.init.uniform_(conv.weight, -bound, bound)
+    torch.nn.init.zeros_(conv.bias)
+    return conv
+
+def ddpm_norm(channels):
+    return torch.nn.GroupNorm(math.gcd(min(channels // 4, 32), channels), channels, eps=1e-6)
+
+class ResidualBlock(torch.nn.Module):
+    """DDPM++ BigGAN block with optional resampling and timestep conditioning.
+
+    Adapted from score_sde_pytorch/models/layerspp.py (Apache-2.0).
+    """
+    def __init__(self, in_channels, out_channels=None, *, up=False, down=False, dropout=0.1,
+                 time_channels=None):
+        super().__init__()
+        out_channels = out_channels or in_channels
+        self.up, self.down = up, down
+        self.norm1 = ddpm_norm(in_channels)
+        self.conv1 = ddpm_conv(in_channels, out_channels)
+        self.norm2 = ddpm_norm(out_channels)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.conv2 = ddpm_conv(out_channels, out_channels, init_scale=0)
+        self.skip = (ddpm_conv(in_channels, out_channels, 1)
+                     if in_channels != out_channels or up or down else torch.nn.Identity())
+        self.time_projection = (torch.nn.Linear(time_channels, out_channels)
+                                if time_channels is not None else None)
+
+    def forward(self, x, time_embedding=None):
+        h = torch.nn.functional.silu(self.norm1(x))
+        if self.up:
+            h = torch.nn.functional.interpolate(h, scale_factor=2, mode='nearest')
+            x = torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')
+        elif self.down:
+            h = torch.nn.functional.avg_pool2d(h, 2)
+            x = torch.nn.functional.avg_pool2d(x, 2)
+        h = self.conv1(h)
+        if self.time_projection is not None:
+            if time_embedding is None:
+                raise ValueError('A timestep embedding is required')
+            h = h + self.time_projection(torch.nn.functional.silu(time_embedding))[:, :, None, None]
+        h = self.conv2(self.dropout(torch.nn.functional.silu(self.norm2(h))))
+        return (self.skip(x) + h) / math.sqrt(2)
+
+class SpatialAttention(torch.nn.Module):
+    """Single-head DDPM++ attention with near-zero output projection."""
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = ddpm_norm(channels)
+        self.q = ddpm_conv(channels, channels, 1, init_scale=0.1)
+        self.k = ddpm_conv(channels, channels, 1, init_scale=0.1)
+        self.v = ddpm_conv(channels, channels, 1, init_scale=0.1)
+        self.projection = ddpm_conv(channels, channels, 1, init_scale=0)
+
+    def forward(self, x):
+        batch, channels, height, width = x.shape
+        normalized = self.norm(x)
+        q, k, v = [layer(normalized).flatten(2) for layer in (self.q, self.k, self.v)]
+        attended = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2).unsqueeze(1), k.transpose(1, 2).unsqueeze(1),
+            v.transpose(1, 2).unsqueeze(1))
+        attended = attended.squeeze(1).transpose(1, 2).reshape(batch, channels, height, width)
+        return (x + self.projection(attended)) / math.sqrt(2)
+
+class CIFAR10UNetParticleGenerator(torch.nn.Module):
+    """Official CIFAR DDPM++ spatial topology adapted to one-pass image generation.
+
+    Reference: yang-song/score_sde_pytorch models/ncsnpp.py and
+    configs/vp/cifar10_ddpmpp.py. Default: no time embedding, sigmoid image output.
+    The DDPM variant adds timestep embeddings and an unrestricted noise head.
+    """
+    def __init__(self, base_channels: int = 128, num_res_blocks: int = 4, *,
+                 time_conditioned: bool = False):
+        super().__init__()
+        self.time_conditioned = time_conditioned
+        self.base_channels = base_channels
+        time_channels = 4 * base_channels if time_conditioned else None
+        self.time_mlp = (torch.nn.Sequential(
+            torch.nn.Linear(base_channels, time_channels), torch.nn.SiLU(),
+            torch.nn.Linear(time_channels, time_channels)) if time_conditioned else None)
+        widths = [base_channels * multiplier for multiplier in (1, 2, 2, 2)]
+        self.input_conv = ddpm_conv(3, widths[0])
+        self.encoders = torch.nn.ModuleList()
+        self.downsamples = torch.nn.ModuleList()
+        skip_channels = [widths[0]]
+        channels = widths[0]
+        for level, width in enumerate(widths):
+            stage = torch.nn.ModuleList()
+            for _ in range(num_res_blocks):
+                stage.append(torch.nn.Sequential(
+                    ResidualBlock(channels, width, time_channels=time_channels),
+                    SpatialAttention(width) if level == 1 else torch.nn.Identity()))
+                channels = width
+                skip_channels.append(channels)
+            self.encoders.append(stage)
+            if level < 3:
+                self.downsamples.append(ResidualBlock(channels, down=True, time_channels=time_channels))
+                skip_channels.append(channels)
+        self.middle = torch.nn.Sequential(ResidualBlock(channels, time_channels=time_channels), SpatialAttention(channels),
+                                          ResidualBlock(channels, time_channels=time_channels))
+        self.decoders = torch.nn.ModuleList()
+        self.decoder_attention = torch.nn.ModuleList()
+        self.upsamples = torch.nn.ModuleList()
+        for level in (3, 2, 1, 0):
+            stage = torch.nn.ModuleList()
+            for _ in range(num_res_blocks + 1):
+                stage.append(ResidualBlock(channels + skip_channels.pop(), widths[level], time_channels=time_channels))
+                channels = widths[level]
+            self.decoders.append(stage)
+            self.decoder_attention.append(SpatialAttention(channels) if level == 1 else torch.nn.Identity())
+            if level > 0:
+                self.upsamples.append(ResidualBlock(channels, up=True, time_channels=time_channels))
+        assert not skip_channels
+        self.output = torch.nn.Sequential(ddpm_norm(channels), torch.nn.SiLU(),
+                                          ddpm_conv(channels, 3, init_scale=0),
+                                          torch.nn.Identity() if time_conditioned else torch.nn.Sigmoid())
+
+    def forward(self, latent, timesteps=None):
+        embedding = None
+        if self.time_conditioned:
+            if timesteps is None or timesteps.shape != (len(latent),):
+                raise ValueError('Expected one timestep per image')
+            half = self.base_channels // 2
+            frequencies = torch.exp(-math.log(10000) * torch.arange(
+                half, device=latent.device, dtype=torch.float32) / max(half - 1, 1))
+            angles = timesteps.float()[:, None] * frequencies[None]
+            positional = torch.cat([angles.sin(), angles.cos()], dim=1)
+            positional = torch.nn.functional.pad(positional, (0, self.base_channels - positional.shape[1]))
+            embedding = self.time_mlp(positional)
+        elif timesteps is not None:
+            raise ValueError('This generator has no timestep conditioning')
+        x = self.input_conv(latent.reshape(-1, 3, 32, 32))
+        skips = [x]
+        for level, stage in enumerate(self.encoders):
+            for block in stage:
+                x = block[1](block[0](x, embedding))
+                skips.append(x)
+            if level < 3:
+                x = self.downsamples[level](x, embedding)
+                skips.append(x)
+        x = self.middle[2](self.middle[1](self.middle[0](x, embedding)), embedding)
+        for level, stage in enumerate(self.decoders):
+            for block in stage:
+                x = block(torch.cat([x, skips.pop()], dim=1), embedding)
+            x = self.decoder_attention[level](x)
+            if level < 3:
+                x = self.upsamples[level](x, embedding)
+        assert not skips
+        output = self.output(x)
+        return output if self.time_conditioned else output.flatten(1)

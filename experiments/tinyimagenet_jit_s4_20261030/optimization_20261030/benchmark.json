@@ -1,0 +1,109 @@
+{
+  "passed": true,
+  "stage": "complete",
+  "job_id": "7661938",
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "torch": "2.6.0+cu124",
+  "tf32": false,
+  "checkpoint": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/tinyimagenet/jit_s4_pair_20261030/riesz/vectorized_20261030/benchmark_checkpoint.pt",
+  "checkpoint_sha256": "0b0ce32ba3bacaa3cd1af95c2c7fd264cfdc91fdf7295dc012c9da6010ebf45d",
+  "source_sha256": {
+    "riesz_loss.py": "2efa10717271f4ded76ecbc0bdca365ae67bde3cb9d178a3a342207d5222c37c",
+    "training_objectives.py": "390c9a34ca760d7245ed581b54132f54ed1d4f4103c8a44573dc5ecd190e8e47",
+    "tests/riesz_loss_reference.py": "24fe7e4fe3ee889cbfebb64c14e62e6231a8cd25f2d3fe8bbf760ef9a0d00628"
+  },
+  "checkpoint_update": 14000,
+  "parity": {
+    "0.001": {
+      "loss": {
+        "relative_l2": 0.0,
+        "max_absolute": 0.0
+      },
+      "field": {
+        "relative_l2": 1.1229888716746395e-07,
+        "max_absolute": 2.384185791015625e-06
+      },
+      "gradient": {
+        "relative_l2": 1.264756583168505e-07,
+        "max_absolute": 2.5579538487363607e-13
+      }
+    },
+    "0.2": {
+      "loss": {
+        "relative_l2": 0.0,
+        "max_absolute": 0.0
+      },
+      "field": {
+        "relative_l2": 1.152027573207562e-07,
+        "max_absolute": 2.384185791015625e-06
+      },
+      "gradient": {
+        "relative_l2": 1.2800138492862715e-07,
+        "max_absolute": 3.979039320256561e-13
+      }
+    },
+    "0.77": {
+      "loss": {
+        "relative_l2": 6.505674639761278e-08,
+        "max_absolute": 5.960464477539063e-08
+      },
+      "field": {
+        "relative_l2": 1.1294096951062751e-07,
+        "max_absolute": 2.384185791015625e-06
+      },
+      "gradient": {
+        "relative_l2": 1.2800341265689758e-07,
+        "max_absolute": 5.684341886080801e-13
+      }
+    },
+    "0.999": {
+      "loss": {
+        "relative_l2": 1.5152787723297974e-06,
+        "max_absolute": 1.6689300537109375e-06
+      },
+      "field": {
+        "relative_l2": 0.0001298816189854225,
+        "max_absolute": 0.004714012145996094
+      },
+      "gradient": {
+        "relative_l2": 0.00012988166010332965,
+        "max_absolute": 1.1183090009581065e-09
+      }
+    }
+  },
+  "model_gradient_relative_l2": 0.0006715096597897611,
+  "timings": {
+    "reference": {
+      "seconds_per_step": 3.4776304222177714,
+      "samples_seconds": [
+        3.47036219201982,
+        3.4773114011622965,
+        3.481207560747862,
+        3.4779494432732463
+      ],
+      "peak_allocated_gb": 18.579086848
+    },
+    "vectorized": {
+      "seconds_per_step": 1.3518874801229686,
+      "samples_seconds": [
+        1.3518971810117364,
+        1.3512314553372562,
+        1.3518777792342007,
+        1.3531571477651596
+      ],
+      "peak_allocated_gb": 18.577317376
+    },
+    "flow_matching": {
+      "seconds_per_step": 1.299830545205623,
+      "samples_seconds": [
+        1.3004174819216132,
+        1.300067013129592,
+        1.2995940772816539,
+        1.2993709789589047
+      ],
+      "peak_allocated_gb": 18.577317376
+    }
+  },
+  "speedup": 2.5724259402871636,
+  "finite_sampler": true
+}

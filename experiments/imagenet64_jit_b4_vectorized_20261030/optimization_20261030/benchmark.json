@@ -1,0 +1,124 @@
+{
+  "passed": true,
+  "job_id": "7661969",
+  "world_size": 4,
+  "global_batch": 1024,
+  "local_batch": 256,
+  "torch": "2.6.0+cu124",
+  "tf32": false,
+  "parity": {
+    "0.001": {
+      "loss": {
+        "relative_l2": 0.0,
+        "max_absolute": 0.0
+      },
+      "field": {
+        "relative_l2": 1.1381648613995134e-07,
+        "max_absolute": 2.384185791015625e-06
+      },
+      "gradient": {
+        "relative_l2": 1.2778121352791755e-07,
+        "max_absolute": 2.8421709430404007e-13
+      }
+    },
+    "0.2": {
+      "loss": {
+        "relative_l2": 0.0,
+        "max_absolute": 0.0
+      },
+      "field": {
+        "relative_l2": 1.189987737295912e-07,
+        "max_absolute": 2.86102294921875e-06
+      },
+      "gradient": {
+        "relative_l2": 1.314426153119414e-07,
+        "max_absolute": 4.547473508864641e-13
+      }
+    },
+    "0.77": {
+      "loss": {
+        "relative_l2": 1.2881503436334264e-07,
+        "max_absolute": 1.1920928955078125e-07
+      },
+      "field": {
+        "relative_l2": 1.1157092826730137e-07,
+        "max_absolute": 2.384185791015625e-06
+      },
+      "gradient": {
+        "relative_l2": 1.2523601662534608e-07,
+        "max_absolute": 9.094947017729282e-13
+      }
+    },
+    "0.999": {
+      "loss": {
+        "relative_l2": 7.087368830521369e-07,
+        "max_absolute": 8.344650268554688e-07
+      },
+      "field": {
+        "relative_l2": 6.54077181327977e-05,
+        "max_absolute": 0.0029021799564361572
+      },
+      "gradient": {
+        "relative_l2": 6.540774317095337e-05,
+        "max_absolute": 8.321237032760109e-10
+      }
+    }
+  },
+  "timings": {
+    "reference": {
+      "seconds_per_step": 2.884899113094434,
+      "samples_seconds": [
+        2.8837272408418357,
+        2.8855557800270617,
+        2.8842424461618066,
+        2.8873854209668934
+      ],
+      "max_rank_peak_allocated_gb": 11.29067325592041
+    },
+    "vectorized": {
+      "seconds_per_step": 0.7578323765192181,
+      "samples_seconds": [
+        0.7578910021111369,
+        0.7578194998204708,
+        0.7578135631047189,
+        0.7578452532179654
+      ],
+      "max_rank_peak_allocated_gb": 11.29309368133545
+    }
+  },
+  "stage": "complete",
+  "checkpoint": "/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/results/imagenet64/jit_b4_xpred_4h100_20261029/vectorized_20261030/resume_checkpoint.pt",
+  "checkpoint_update": 20000,
+  "checkpoint_sha256": "25894af4f0f365a98c1efbb72d9b8154b84b5194ae40b0f86531c413f8718a59",
+  "source_sha256": {
+    "riesz_loss.py": "2efa10717271f4ded76ecbc0bdca365ae67bde3cb9d178a3a342207d5222c37c",
+    "cifar_riesz_velocity.py": "850b58e35fc3ccc1b9c91351a2ec770e2697871a7d442144943b5ebe82db3d30",
+    "tests/riesz_loss_reference.py": "24fe7e4fe3ee889cbfebb64c14e62e6231a8cd25f2d3fe8bbf760ef9a0d00628"
+  },
+  "hardware": [
+    {
+      "rank": 0,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "2"
+    },
+    {
+      "rank": 1,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "3"
+    },
+    {
+      "rank": 2,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "4"
+    },
+    {
+      "rank": 3,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "allocated_gpu": "5"
+    }
+  ],
+  "ddp_model_gradient_relative_l2": 0.0003071294601477678,
+  "speedup": 3.806777332930794,
+  "ddp_parameter_max_difference": 0.0,
+  "finite_sampler": true
+}

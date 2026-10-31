@@ -1,0 +1,15 @@
+{
+  "revision": 2,
+  "sha256": {
+    "core.py": "636640fdece3606906b5ecd2bfa5cc882c1db03cb21633476424a59b183f435d",
+    "legacy_core.py": "75cafedba284c49e4d16a3d094c99d2d29a91ccdacf9d16e87036f2d7ed63319",
+    "original_riesz.py": "2efa10717271f4ded76ecbc0bdca365ae67bde3cb9d178a3a342207d5222c37c",
+    "study.py": "5deed15204a6b058bde0d1779c270726c28e2ccd282b8d60527bf1729f6ecf51",
+    "test_science.py": "8fea382c7ada8966855e6e616bf75fc50556b27b0495c017cda51856effe670b",
+    "run_cluster.sh": "5c12812dd8edf309b5e630e000dcc71cf7400c79dd33af21725d0cbec54ffafe",
+    "config.json": "dabc70b6948e05251aaec6251cef299efbdbdaf45db397a4e0eb50da2dfd9a5c",
+    "README.md": "eda6059a8e44e64fbe3260a264209879f9d7d4fb1b10a500469ebdae6648f642",
+    "SOFTMAX_RIESZ_LICENSE.txt": "ee12cc1a4b06a05a337d9fb70b72867afaed7072d6ead0dfd3f64fd2249e3c12",
+    "DRIFTING_LICENSE.txt": "d91fede4cb730000a54a5d41a75b5b1a3834adda36278d5140538f937809173c"
+  }
+}

@@ -26,7 +26,7 @@ FID-10K and sample grids are saved separately for scales 1, 1.5, 2, and 3,
 using the same latent seed and balanced class labels. The usual
 `fid_metrics.json`, plots, and trajectory use the first evaluation scale (1).
 All scales are recorded in `fid_cfg_metrics.json`.
-Scheduler logs are `/home/zongchen/cifar_cfg_b.o<JOB_ID>.<TASK_ID>`.
+Scheduler logs are `/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/cifar_cfg_b.o<JOB_ID>.<TASK_ID>`.
 These jobs still use pixel views rather than the reference MAE features.
 
 Direct CLI usage supports `--cfg`, `--cfg-min`, `--cfg-max`, `--cfg-power`,
@@ -61,13 +61,19 @@ Each task requests one H100 for 48 hours and writes a source snapshot,
 `results/cifar/officialB_cifar_<JOB_ID>_<TASK_ID>_<OBJECTIVE>/` in the main
 cluster checkout. FID-10K runs every 5,000 updates; the latest resumable
 checkpoint is saved every 2,000 updates. Scheduler logs are
-`/home/zongchen/cifar_official_b.o<JOB_ID>.<TASK_ID>`.
+`/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/cifar_official_b.o<JOB_ID>.<TASK_ID>`.
 
 `run_cifar_h100.sh` launches the CIFAR-10 DDPM++ one-pass generator with
 softmax Riesz, EMA 0.999, and a 2,000-epoch budget. It requests one H100,
 32 GB host memory, 48 hours, and the `aihub_ucl` project.
 
-On `cs-cluster`, change to `/home/zongchen/mmd_flow_hudson_new`, with the source
+The cluster checkout, including Git metadata, datasets, saved runs, and source
+snapshots, lives on SAN. The previous home-directory path is a compatibility
+symlink. Historical run configs and logs retain their recorded paths; the symlink
+keeps those paths usable. New jobs resolve the physical project directory and
+write outputs relative to it. Create `logs/` before submitting (`mkdir -p logs`).
+
+On `cs-cluster`, change to `/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new`, with the source
 and FID weights in `assets/`. The default dataset root is
 `/SAN/intelsys/imagenet_mmd_flow/data`; the CIFAR-10 archive lives at
 `CIFAR10/raw/cifar-10-python.tar.gz` beneath that root (the binary archive is
@@ -75,7 +81,7 @@ also supported). Override it with
 `qsub -v DATA_ROOT=/absolute/data/path` if needed:
 
 ```bash
-cd /home/zongchen/mmd_flow_hudson_new
+cd /SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new
 qsub -P aihub_ucl scripts/cs_cluster/run_cifar_h100.sh
 ```
 
@@ -89,9 +95,9 @@ qsub -P aihub_ucl scripts/cs_cluster/run_cifar_multiscale_h100.sh
 Its result directory includes `_multiscale` before the job ID. The source copy
 must include `multiscale.py` and `tests/test_multiscale.py`.
 
-The merged scheduler log is written to the home directory as
-`/home/zongchen/cifar_ddpmpp_ema.o<JOB_ID>` for the base launcher, or
-`/home/zongchen/cifar_multiscale.o<JOB_ID>` for the multiscale launcher,
+The merged scheduler log is written to the SAN checkout's `logs/` directory as
+`/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/cifar_ddpmpp_ema.o<JOB_ID>` for the base launcher, or
+`/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/cifar_multiscale.o<JOB_ID>` for the multiscale launcher,
 using the number returned by `qsub`.
 
 This default applies to new submissions. An explicit `qsub -o` overrides it.
@@ -113,7 +119,7 @@ python scripts/cs_cluster/sync_cifar_h100.py path/to/deployment.json
 
 The deployment JSON contains `job_id`, `remote_source`, `remote_output`, and
 `local_output`. For new submissions, also set `remote_log` to
-the appropriate home-directory scheduler log above. Older deployment records without this
+the appropriate SAN scheduler log above. Older deployment records without this
 field retain their original `remote_source/scheduler.log` location.
 The watcher uses the `cs-cluster` SSH alias, copies available
 outputs every 300 seconds, and verifies final artifact hashes after completion.
@@ -199,7 +205,7 @@ one Adam update is taken per real minibatch.
 Outputs live under `results/cifar/ablation500_<JOB_ID>_<TASK_ID>_<VARIANT>/`.
 Each task runs its own source copy in `source/`, records source hashes, and
 writes `job_status.json` and `run.log`. Scheduler logs go to
-`/home/zongchen/cifar_ablation.o<JOB_ID>.<TASK_ID>`. Completion checks require
+`/SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/cifar_ablation.o<JOB_ID>.<TASK_ID>`. Completion checks require
 501 metric rows, 26 FID evaluations, 98,000 updates, and a final checkpoint;
 successful completion also writes SHA-256 hashes in `artifact_manifest.json`.
 The existing single-job transfer watcher is not an array-task watcher.

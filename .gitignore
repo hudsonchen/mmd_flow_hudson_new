@@ -25,6 +25,7 @@ __pycache__/
 /env/
 
 # Local logs and scheduler output
+/logs/
 *.log
 *.o[0-9]*
 *.e[0-9]*

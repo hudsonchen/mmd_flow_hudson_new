@@ -9,10 +9,10 @@
 #$ -pe gpu 1
 #$ -l tmem=32G,h_rt=24:00:00,gpu=true,gpu_type=h100
 #$ -j y
-#$ -o /home/zongchen/
+#$ -o /SAN/intelsys/imagenet_mmd_flow/mmd_flow_hudson_new/logs/
 set -euo pipefail
 # SGE executes a spooled copy of this script; -cwd preserves the submission root.
-PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd -P)}"
 PYTHON="${PYTHON:-/home/zongchen/miniconda3/envs/mmd_flow/bin/python}"
 DATA_ROOT="${DATA_ROOT:-/SAN/intelsys/imagenet_mmd_flow/data}"
 TASK_ID="${SGE_TASK_ID:?Submit with qsub (or set SGE_TASK_ID=1..8 for --dry-run)}"
