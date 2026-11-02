@@ -26,6 +26,10 @@ field, and their samples and quality metrics are checked explicitly.
 
 The U-Net uses fixed coordinate channels and time conditioning. Hidden
 features are not used by the kernel, and there is no pretrained encoder.
+Its bounded output is $D_\theta(x,t)=\tanh(x+f_\theta(x,t))$. The input skip
+keeps random initial particles distinguishable through the long contraction
+path; a nearly zero constant predictor would compress them almost to one
+image before training. This skip is not a reconstruction loss.
 
 ## Distribution objective
 

@@ -51,7 +51,9 @@ class CleanPredictor(nn.Module):
         h=self.mid2(self.mid1(self.down2(b),time),time)
         h=self.dec2(torch.cat([F.interpolate(h,size=b.shape[-2:],mode='nearest'),b],1),time)
         h=self.dec1(torch.cat([F.interpolate(h,size=a.shape[-2:],mode='nearest'),a],1),time)
-        return torch.tanh(self.output(F.silu(h)))
+        # Keep initial particles distinguishable during a long contraction path.
+        # This is an input skip inside the bounded predictor, not a training target.
+        return torch.tanh(x+self.output(F.silu(h)))
 
 
 def velocity(model,x,t,epsilon=.001):
