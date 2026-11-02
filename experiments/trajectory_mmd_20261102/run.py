@@ -67,9 +67,13 @@ def exact_mmd(x,y,bands):
     # Blocked summation avoids quadratic evaluation memory.
     def total(a,b):
         value=0.
-        for aa in a.split(256):
-            for bb in b.split(256):
-                d=torch.cdist(aa.flatten(1),bb.flatten(1)).square()
+        same = a is b
+        for i,aa in enumerate(a.split(256)):
+            for j,bb in enumerate(b.split(256)):
+                # Double precision and exact self diagonals matter for escaped tails.
+                d=torch.cdist(aa.flatten(1).double(),bb.flatten(1).double()).square()
+                if same and i == j:
+                    d.diagonal().zero_()
                 value+=float(torch.stack([(-d/(2*s*s)).exp().sum() for s in bands]).mean())
         return value
     return (total(x,x)-len(x))/(len(x)*(len(x)-1)) + \
@@ -132,7 +136,7 @@ def run(args):
         source_hashes={p.name:sha(p) for p in source.glob('*.py')},
         torch_version=torch.__version__, device_name=torch.cuda.get_device_name(device) if device.type=='cuda' else 'CPU')
     write(out/'config.json',config)
-    model=Velocity(args.dataset,args.width).to(device)
+    model=Velocity(args.dataset,args.width,args.linear_skip,args.stable_field).to(device)
     optimizer=torch.optim.Adam(model.parameters(),lr=args.lr,betas=(.9,.95))
     sg=torch.Generator(device=device).manual_seed(11000+args.seed)
     rg=torch.Generator(device=device).manual_seed(21000+args.seed)
@@ -261,7 +265,11 @@ def arguments():
     p.add_argument('--eval-n',type=int,default=2048)
     p.add_argument('--threads',type=int,default=1)
     p.add_argument('--checkpoint-steps',action='store_true')
+    p.add_argument('--linear-skip',action='store_true')
+    p.add_argument('--stable-field',action='store_true')
     a=p.parse_args()
+    if a.stable_field:
+        a.linear_skip=True
     if min(a.updates,a.train_steps,a.eval_steps,a.eval_every)<1 or min(a.batch,a.reference_batch,a.eval_n)<2:
         p.error('Positive budgets and batches >= 2 required')
     if a.dataset=='mnist' and a.eval_n>10000:

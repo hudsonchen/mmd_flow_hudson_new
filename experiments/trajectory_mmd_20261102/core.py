@@ -7,9 +7,10 @@ from torch.utils.checkpoint import checkpoint
 
 
 class Velocity(nn.Module):
-    def __init__(self, dataset, width=64):
+    def __init__(self, dataset, width=64, linear_skip=False, stable_field=False):
         super().__init__()
         self.dataset = dataset
+        self.stable_field = stable_field
         dim = 2 if dataset == 'mog' else 784
         # Globally connected image velocity: all state coordinates remain pixels.
         self.net = nn.Sequential(nn.Linear(dim + 9, width), nn.SiLU(),
@@ -17,12 +18,28 @@ class Velocity(nn.Module):
             nn.SiLU(), nn.Linear(width, dim))
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        self.skip = None
+        if linear_skip or stable_field:
+            # Full-rank scalar linear field avoids a fixed output-subspace invariant
+            # when the MLP width is less than the number of image coordinates.
+            self.skip = nn.Sequential(nn.Linear(9,32), nn.SiLU(), nn.Linear(32,1))
+            nn.init.zeros_(self.skip[-1].weight)
+            nn.init.zeros_(self.skip[-1].bias)
 
     def forward(self, x, t):
         flat = x.flatten(1)
         time = flat.new_full((len(x), 1), float(t))
         phase = time * flat.new_tensor([1., 2., 4., 8.]) * math.pi
-        return self.net(torch.cat([flat, time, phase.sin(), phase.cos()], 1)).reshape_as(x)
+        time_features = torch.cat([time, phase.sin(), phase.cos()], 1)
+        velocity = self.net(torch.cat([flat, time_features], 1))
+        if self.skip is not None:
+            coefficient = self.skip(time_features)
+            if self.stable_field:
+                # A smooth vector-field parameterization, not clipping ODE states.
+                velocity = 4*torch.tanh(velocity/4)
+                coefficient = -F.softplus(coefficient)
+            velocity = velocity + coefficient*flat
+        return velocity.reshape_as(x)
 
 
 def integrate(model, z, end=1., steps=16, checkpoint_steps=False):

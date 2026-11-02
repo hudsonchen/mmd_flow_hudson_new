@@ -17,7 +17,8 @@ a=p.parse_args()
 torch.set_num_threads(1)
 state=torch.load(a.checkpoint,map_location=a.device,weights_only=False)
 config=state['config']
-model=Velocity(config['dataset'],config['width']).to(a.device).eval()
+model=Velocity(config['dataset'],config['width'],config.get('linear_skip',False),
+    config.get('stable_field',False)).to(a.device).eval()
 model.load_state_dict(state['model'])
 shape=(2,) if config['dataset']=='mog' else (1,28,28)
 g=torch.Generator(device=a.device).manual_seed(a.seed)
